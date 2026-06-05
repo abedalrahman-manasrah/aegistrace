@@ -1,2 +1,5 @@
+anthropic
 reportlab
 openai
+matplotlib
+Pillow

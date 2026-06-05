@@ -1,5 +1,19 @@
 {
-  "last_folder": "",
-  "last_case_id": "",
-  "openai_api_key": ""
+  "last_folder": "C:/Users/vbngv/AppData/Local/Google/Chrome/User Data/Default",
+  "last_case_id": "01",
+  "anthropic_api_key": "sk-qVpyd0dhJncICORHFrM4hecgj9cCB2eGGdgzxFAgXNUrUMYm",
+  "last_investigator": "عبد الرحمن مناصرة",
+  "suspicious_keywords": [
+    "vpn",
+    "tor",
+    "crypto",
+    "binance",
+    "hacker",
+    "proxy",
+    "onion",
+    "darkweb",
+    "bypass",
+    "exploit",
+    "ward"
+  ]
 }
