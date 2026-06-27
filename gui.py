@@ -61,6 +61,8 @@ class ForensicTool:
         self.timeline = []
         self.findings = []
         self.summary = ""
+        self._case_a_data = None
+        self._case_b_data = None
 
         self.settings["last_case_id"] = self.case_meta["case_id"]
         save_settings(self.settings)
@@ -157,7 +159,7 @@ class ForensicTool:
 
     def log_chain_event(self, msg):
         now = datetime.now().strftime("%H:%M:%S")
-        append_chain_log(self.case_meta["chain_log_path"], msg, self.log_index)
+        append_chain_log(self.case_meta["chain_log_path"], msg, index=self.log_index, examiner=self.investigator or "Unknown")
         self.log_index += 1
         self.chain_text.insert(tk.END, f"[{now}] {msg}\n")
         self.chain_text.see(tk.END)
@@ -267,6 +269,7 @@ class ForensicTool:
         self.api_var = tk.StringVar(value=saved_key)
         self.ai_model_var = tk.StringVar(value=self.settings.get("ai_model", AI_MODEL))
         self.ai_base_url_var = tk.StringVar(value=self.settings.get("ai_base_url", AI_BASE_URL))
+        self.ai_provider_var = tk.StringVar(value=self.settings.get("ai_provider", "openrouter"))
         self.api_entry = tk.Entry(
             api_row,
             textvariable=self.api_var,
@@ -297,6 +300,17 @@ class ForensicTool:
         model_row = tk.Frame(right_card, bg="#162233")
         model_row.pack(fill="x", padx=12, pady=(4, 4))
 
+        tk.Label(model_row, text="Provider:", fg="#94a3b8", bg="#162233", font=("Consolas", 9)).pack(side="left")
+        provider_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.ai_provider_var,
+            values=["openrouter", "openai", "anthropic"],
+            state="readonly",
+            width=12,
+            font=("Segoe UI", 9)
+        )
+        provider_combo.pack(side="left", padx=(6, 10))
+
         tk.Label(model_row, text="Model:", fg="#94a3b8", bg="#162233", font=("Consolas", 9)).pack(side="left")
         tk.Entry(
             model_row,
@@ -306,7 +320,7 @@ class ForensicTool:
             insertbackground="white",
             relief="flat",
             font=("Consolas", 9),
-            width=28,
+            width=18,
         ).pack(side="left", padx=(6, 10), ipady=4)
 
         tk.Label(model_row, text="Base URL:", fg="#94a3b8", bg="#162233", font=("Consolas", 9)).pack(side="left")
@@ -381,14 +395,15 @@ class ForensicTool:
         self.search_entry.pack(side="left", padx=(0, 10), pady=5)
         self.search_entry.bind("<KeyRelease>", lambda e: self.filter_treeview())
 
-        self._button(bar, "Select Chrome Folder", self.select_folder, "#334155").pack(side="left", padx=4)
+        self._button(bar, "Browse", self.select_folder, "#334155").pack(side="left", padx=4)
         self._button(bar, "Configure Keywords", self.configure_keywords, "#475569").pack(side="left", padx=4)
-        self._button(bar, "Run Full Analysis", self.analyze_all, "#0f766e").pack(side="left", padx=4)
+        self._button(bar, "Run Analysis", self.analyze_all, "#0f766e").pack(side="left", padx=4)
         self._button(bar, "Generate AI Summary", self.run_ai, "#7c3aed").pack(side="left", padx=4)
         self._button(bar, "Export HTML Report", self.export_html_report, "#2563eb").pack(side="left", padx=4)
         self._button(bar, "Export PDF", self.export_pdf_report, "#b45309").pack(side="left", padx=4)
         self._button(bar, "Export JSON", self.export_json_bundle, "#1d4ed8").pack(side="left", padx=4)
         self._button(bar, "Export XLSX", self.export_xlsx_report, "#15803d").pack(side="left", padx=4)
+        self._button(bar, "Open Report Folder", self.open_report_folder, "#475569").pack(side="left", padx=4)
         self._button(bar, "Export Timeline CSV", self.export_timeline_report, "#475569").pack(side="left", padx=4)
         self._button(bar, "Export History CSV", self.export_history_report, "#475569").pack(side="left", padx=4)
 
@@ -491,7 +506,7 @@ class ForensicTool:
         self.tabs.add(self.summary_tab,   text="Analyst Summary")
         self.tabs.add(self.timeline_tab,  text="Timeline")
         self.tabs.add(self.chain_tab,     text="Chain Log")
-        self.tabs.add(self.compare_tab,   text="⚖ Case Compare")
+        self.tabs.add(self.compare_tab,   text="Case Compare")
 
         self._build_evidence_tab()
         self._build_dashboard_tab()
@@ -612,14 +627,19 @@ class ForensicTool:
         top.pack(fill="x", padx=14, pady=12)
 
         tk.Label(
-            top, text="⚖  Case Comparison",
+            top, text="Case Comparison",
             fg="#7dd3fc", bg="#162233",
             font=("Segoe UI", 14, "bold")
         ).pack(side="left")
 
         self._button(
-            top, "Load Comparison Case (JSON)",
-            self.load_compare_case, "#1d4ed8"
+            top, "Load Case B JSON",
+            self.load_case_b, "#be185d"
+        ).pack(side="right", padx=6)
+
+        self._button(
+            top, "Load Case A JSON",
+            self.load_case_a, "#1d4ed8"
         ).pack(side="right", padx=6)
 
         self._button(
@@ -627,8 +647,8 @@ class ForensicTool:
             self.clear_compare, "#475569"
         ).pack(side="right")
 
-        # Label showing which file is loaded
-        self.compare_file_var = tk.StringVar(value="No comparison case loaded.")
+        # Label showing which files are loaded
+        self.compare_file_var = tk.StringVar(value="Case A: Current Case | Case B: None Loaded")
         tk.Label(
             self.compare_tab,
             textvariable=self.compare_file_var,
@@ -646,8 +666,8 @@ class ForensicTool:
         )
         for col, title, width in [
             ("artifact",      "Artifact",          160),
-            ("current_case",  "Current Case",      130),
-            ("compare_case",  "Compared Case",     130),
+            ("current_case",  "Case A (Current)",  130),
+            ("compare_case",  "Case B (Compared)", 130),
             ("diff",          "Δ Difference",      120),
         ]:
             self.compare_tree.heading(col, text=title)
@@ -663,30 +683,56 @@ class ForensicTool:
         self.compare_tree.pack(side="left", fill="both", expand=True)
         ys.pack(side="right", fill="y")
 
-        # Findings comparison
-        tk.Label(
-            self.compare_tab,
-            text="Findings in Comparison Case",
+        # Findings comparison side-by-side
+        findings_frame = tk.Frame(self.compare_tab, bg="#162233")
+        findings_frame.pack(fill="both", expand=True, padx=14, pady=10)
+
+        # Left panel: Case A Findings
+        left_f_panel = tk.Frame(findings_frame, bg="#162233")
+        left_f_panel.pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self.case_a_findings_label = tk.Label(
+            left_f_panel,
+            text="Case A Findings",
             fg="#e2e8f0", bg="#162233",
             font=("Segoe UI", 10, "bold")
-        ).pack(anchor="w", padx=14, pady=(10, 4))
-
-        self.compare_findings_list = tk.Listbox(
-            self.compare_tab,
+        )
+        self.case_a_findings_label.pack(anchor="w", pady=(0, 4))
+        self.case_a_findings_list = tk.Listbox(
+            left_f_panel,
             bg="#0f1720", fg="white",
             selectbackground="#1d4ed8",
             relief="flat", font=("Segoe UI", 9),
             height=7
         )
-        self.compare_findings_list.pack(fill="x", padx=14, pady=(0, 12))
+        self.case_a_findings_list.pack(fill="both", expand=True)
 
-        self._compare_data = None
+        # Right panel: Case B Findings
+        right_f_panel = tk.Frame(findings_frame, bg="#162233")
+        right_f_panel.pack(side="right", fill="both", expand=True, padx=(6, 0))
+        self.case_b_findings_label = tk.Label(
+            right_f_panel,
+            text="Case B Findings",
+            fg="#e2e8f0", bg="#162233",
+            font=("Segoe UI", 10, "bold")
+        )
+        self.case_b_findings_label.pack(anchor="w", pady=(0, 4))
+        self.case_b_findings_list = tk.Listbox(
+            right_f_panel,
+            bg="#0f1720", fg="white",
+            selectbackground="#1d4ed8",
+            relief="flat", font=("Segoe UI", 9),
+            height=7
+        )
+        self.case_b_findings_list.pack(fill="both", expand=True)
 
-    def load_compare_case(self):
-        """Load a previously exported JSON bundle for comparison."""
+        # Alias self.compare_findings_list for compatibility
+        self.compare_findings_list = self.case_b_findings_list
+
+    def load_case_a(self):
+        """Load JSON for Case A."""
         import json as _json
         path = filedialog.askopenfilename(
-            title="Select Comparison Case JSON",
+            title="Select Case A JSON",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
         )
         if not path:
@@ -694,19 +740,72 @@ class ForensicTool:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 bundle = _json.load(f)
-            self._compare_data = bundle
-            self.compare_file_var.set(f"Loaded: {path}")
+            self._case_a_data = bundle
+            self._update_compare_label()
             self._refresh_compare_view()
-            self.log_chain_event(f"Comparison case loaded: {path}")
+            self.log_chain_event(f"Case A loaded: {path}")
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
 
-    def _refresh_compare_view(self):
-        """Populate the comparison treeview."""
-        if not self._compare_data:
+    def load_case_b(self):
+        """Load JSON for Case B."""
+        import json as _json
+        path = filedialog.askopenfilename(
+            title="Select Case B JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not path:
             return
-        compare_data = self._compare_data.get("data", {})
-        compare_findings = self._compare_data.get("findings", [])
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                bundle = _json.load(f)
+            self._case_b_data = bundle
+            self._update_compare_label()
+            self._refresh_compare_view()
+            self.log_chain_event(f"Case B loaded: {path}")
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+
+    def load_compare_case(self):
+        self.load_case_b()
+
+    def _update_compare_label(self):
+        label_text = ""
+        if self._case_a_data:
+            label_text += f"Case A: {self._case_a_data.get('case_id', 'Unknown')}"
+        else:
+            label_text += "Case A: Current Case"
+            
+        label_text += " | "
+        
+        if self._case_b_data:
+            label_text += f"Case B: {self._case_b_data.get('case_id', 'Unknown')}"
+        else:
+            label_text += "Case B: None Loaded"
+        self.compare_file_var.set(label_text)
+
+    def _refresh_compare_view(self):
+        """Populate the comparison treeview and listboxes."""
+        if self._case_a_data:
+            case_a_data = self._case_a_data.get("data", {})
+            case_a_findings = self._case_a_data.get("findings", [])
+            case_a_name = self._case_a_data.get("case_id", "Case A")
+        else:
+            case_a_data = self.data or {}
+            case_a_findings = self.findings or []
+            case_a_name = self.case_meta.get("case_id", "Current Case") if self.case_meta else "Current Case"
+
+        if self._case_b_data:
+            case_b_data = self._case_b_data.get("data", {})
+            case_b_findings = self._case_b_data.get("findings", [])
+            case_b_name = self._case_b_data.get("case_id", "Case B")
+        else:
+            case_b_data = {}
+            case_b_findings = []
+            case_b_name = "Compared Case"
+
+        self.compare_tree.heading("current_case", text=case_a_name)
+        self.compare_tree.heading("compare_case", text=case_b_name)
 
         self.compare_tree.delete(*self.compare_tree.get_children())
         for artifact in [
@@ -714,29 +813,44 @@ class ForensicTool:
             "bookmarks", "preferences", "webdata", "extensions",
             "favicons", "sessions", "local_storage", "deleted_records"
         ]:
-            cur_count  = len(self.data.get(artifact, []))
-            comp_count = len(compare_data.get(artifact, []))
-            diff = cur_count - comp_count
+            count_a = len(case_a_data.get(artifact, [])) if isinstance(case_a_data.get(artifact), list) else 0
+            count_b = len(case_b_data.get(artifact, [])) if isinstance(case_b_data.get(artifact), list) else 0
+            diff = count_a - count_b
             tag = "more" if diff > 0 else ("less" if diff < 0 else "same")
             diff_str = f"+{diff}" if diff > 0 else str(diff)
             self.compare_tree.insert(
                 "", "end",
-                values=(artifact.replace("_", " ").title(), cur_count, comp_count, diff_str),
+                values=(artifact.replace("_", " ").title(), count_a, count_b, diff_str),
                 tags=(tag,)
             )
 
-        self.compare_findings_list.delete(0, tk.END)
-        for f in compare_findings:
-            self.compare_findings_list.insert(
-                tk.END,
-                f"[{f.get('severity','?')}] {f.get('title','')}"
-            )
+        self.case_a_findings_label.config(text=f"{case_a_name} Findings")
+        self.case_a_findings_list.delete(0, tk.END)
+        if not case_a_findings:
+            self.case_a_findings_list.insert(tk.END, "No findings.")
+        else:
+            for f in case_a_findings:
+                self.case_a_findings_list.insert(
+                    tk.END, f"[{f.get('severity','?')}] {f.get('title','')}"
+                )
+
+        self.case_b_findings_label.config(text=f"{case_b_name} Findings")
+        self.case_b_findings_list.delete(0, tk.END)
+        if not case_b_findings:
+            self.case_b_findings_list.insert(tk.END, "No findings.")
+        else:
+            for f in case_b_findings:
+                self.case_b_findings_list.insert(
+                    tk.END, f"[{f.get('severity','?')}] {f.get('title','')}"
+                )
 
     def clear_compare(self):
-        self._compare_data = None
-        self.compare_file_var.set("No comparison case loaded.")
+        self._case_a_data = None
+        self._case_b_data = None
+        self._update_compare_label()
         self.compare_tree.delete(*self.compare_tree.get_children())
-        self.compare_findings_list.delete(0, tk.END)
+        self.case_a_findings_list.delete(0, tk.END)
+        self.case_b_findings_list.delete(0, tk.END)
 
     def _build_right_panel(self, parent):
         frame = tk.Frame(parent, bg="#162233", highlightthickness=1, highlightbackground="#22344a")
@@ -804,6 +918,7 @@ class ForensicTool:
         self.settings["openrouter_api_key"] = key_val
         self.settings["ai_model"] = self.ai_model_var.get().strip() or AI_MODEL
         self.settings["ai_base_url"] = self.ai_base_url_var.get().strip() or AI_BASE_URL
+        self.settings["ai_provider"] = self.ai_provider_var.get().strip()
         # Keep legacy key names for backward compatibility, but prefer openrouter_api_key.
         self.settings["openai_api_key"] = key_val
         self.settings["last_case_id"] = self.case_meta["case_id"]
@@ -873,7 +988,7 @@ class ForensicTool:
             self.root.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
 
     def _increment_progress(self):
-        self.progress["value"] += (100 / 12)
+        self.progress["value"] += (100 / 13)
         self.root.update_idletasks()
 
     def _on_analysis_complete(self):
@@ -1176,18 +1291,19 @@ class ForensicTool:
         api_key = self.api_var.get().strip()
         model = self.ai_model_var.get().strip() or AI_MODEL
         base_url = self.ai_base_url_var.get().strip() or AI_BASE_URL
+        provider = self.ai_provider_var.get().strip()
         self.log_chain_event(f"AI summary requested using {model} (Threaded).")
 
         # Run AI in background
-        threading.Thread(target=self._run_ai_thread, args=(api_key, model, base_url), daemon=True).start()
+        threading.Thread(target=self._run_ai_thread, args=(api_key, model, base_url, provider), daemon=True).start()
 
-    def _run_ai_thread(self, api_key, model, base_url):
+    def _run_ai_thread(self, api_key, model, base_url, provider):
         try:
             summary = generate_ai_summary(
                 self.data,
                 self.findings,
                 api_key=api_key,
-                provider="openrouter",
+                provider=provider,
                 model=model,
                 base_url=base_url,
             )
@@ -1240,7 +1356,7 @@ class ForensicTool:
                 self.data,
                 self.findings,
                 api_key=self.api_var.get().strip(),
-                provider="openrouter",
+                provider=self.ai_provider_var.get().strip(),
                 model=self.ai_model_var.get().strip() or AI_MODEL,
                 base_url=self.ai_base_url_var.get().strip() or AI_BASE_URL,
             )
@@ -1363,3 +1479,22 @@ class ForensicTool:
         except Exception as e:
             self.log_chain_event(f"XLSX export error: {str(e)}")
             messagebox.showerror("XLSX Export Error", str(e))
+
+    def open_report_folder(self):
+        if not self.case_meta or not self.case_meta.get("case_dir"):
+            messagebox.showwarning("No Case", "Please run analysis or initialize case first.")
+            return
+        
+        case_dir = self.case_meta["case_dir"]
+        import sys
+        import subprocess
+        try:
+            if os.name == 'nt':
+                os.startfile(case_dir)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', case_dir])
+            else:
+                subprocess.Popen(['xdg-open', case_dir])
+            self.log_chain_event(f"Report folder opened: {case_dir}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open folder:\n{str(e)}")
