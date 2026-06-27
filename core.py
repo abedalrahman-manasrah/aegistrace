@@ -1,4 +1,5 @@
 import os
+import html
 import json
 import csv
 import sqlite3
@@ -27,7 +28,7 @@ def get_logo_base64():
     return ""
 
 APP_NAME = "AegisTrace"
-APP_AUTHOR = "Built by Abed Alrahman Manasrah"
+APP_AUTHOR = "Abed Alrahman Yousef Mousa"
 EXPORT_DIR = os.path.join(os.getcwd(), "Forensics_Reports")
 SETTINGS_FILE = os.path.join(os.getcwd(), "aegistrace_settings.json")
 
@@ -109,12 +110,20 @@ def generate_sha256(file_path):
     return sha256.hexdigest()
 
 
-def safe_copy_db(original_path, destination_dir):
+def safe_copy_db(original_path, destination_dir, case_meta=None):
+    """Copy a Chrome SQLite database to the Evidence directory with SHA-256 verification.
+
+    - Copies the database and companion files (-wal, -journal, -shm).
+    - Computes SHA-256 for the original and the working copy.
+    - Verifies both hashes match; logs an integrity error if they do not.
+    - Logs the full operation to the chain-of-custody log when case_meta is provided.
+    - Returns the working copy path for backward compatibility.
+    """
     ensure_dir(destination_dir)
     base_name = os.path.basename(original_path)
     copy_path = os.path.join(destination_dir, f"{base_name}_copy")
     shutil.copy2(original_path, copy_path)
-    
+
     # Copy associated WAL, Journal, and SHM files if they exist
     for suffix in ["-wal", "-journal", "-shm"]:
         extra_file = original_path + suffix
@@ -123,7 +132,33 @@ def safe_copy_db(original_path, destination_dir):
                 shutil.copy2(extra_file, os.path.join(destination_dir, f"{base_name}_copy{suffix}"))
             except Exception as e:
                 logger.warning(f"Could not copy companion database file {extra_file}: {str(e)}")
-                
+
+    # SHA-256 integrity verification
+    orig_sha256 = generate_sha256(original_path)
+    copy_sha256 = generate_sha256(copy_path)
+    integrity_ok = orig_sha256 == copy_sha256
+    if not integrity_ok:
+        logger.error(
+            f"INTEGRITY ERROR: SHA-256 mismatch after copying '{original_path}'.\n"
+            f"  Original : {orig_sha256}\n"
+            f"  Copy     : {copy_sha256}"
+        )
+
+    # Chain-of-custody logging
+    if case_meta and isinstance(case_meta, dict):
+        chain_log = case_meta.get("chain_log_path", "")
+        examiner = case_meta.get("investigator", "Unknown")
+        if chain_log:
+            append_chain_log(
+                chain_log,
+                message=f"Evidence copy created: {base_name}",
+                examiner=examiner,
+                details=f"Original: {original_path} | Copy: {copy_path}",
+                orig_sha256=orig_sha256,
+                copy_sha256=copy_sha256,
+                status="OK" if integrity_ok else "INTEGRITY_ERROR",
+            )
+
     return copy_path
 
 
@@ -166,18 +201,58 @@ def classify_url(url):
     return "Other"
 
 
-def append_chain_log(chain_log_path, message, index):
-    now = datetime.now().strftime("%H:%M:%S")
+def next_chain_index(chain_log_path):
+    """Count existing numbered entries in chain_log.txt to get the next sequential index."""
+    if not os.path.exists(chain_log_path):
+        return 1
+    count = 0
+    try:
+        with open(chain_log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("[Entry "):
+                    count += 1
+    except Exception:
+        pass
+    return count + 1
+
+
+def append_chain_log(
+    chain_log_path,
+    message,
+    index=None,
+    examiner="",
+    details="",
+    orig_sha256="",
+    copy_sha256="",
+    status="OK",
+):
+    """Append a structured, numbered chain-of-custody entry to chain_log.txt."""
+    if index is None:
+        index = next_chain_index(chain_log_path)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [f"[Entry {index}]"]
+    lines.append(f"  Timestamp : {ts}")
+    lines.append(f"  Examiner  : {examiner or 'Unknown'}")
+    lines.append(f"  Action    : {message}")
+    if details:
+        lines.append(f"  Details   : {details}")
+    if orig_sha256:
+        lines.append(f"  Orig SHA256 : {orig_sha256}")
+    if copy_sha256:
+        lines.append(f"  Copy SHA256 : {copy_sha256}")
+    lines.append(f"  Status    : {status}")
+    lines.append("")
     with open(chain_log_path, "a", encoding="utf-8") as log:
-        log.write(f"[{index}] {now} - {message}\n\n")
+        log.write("\n".join(lines) + "\n")
 
 
-def analyze_history(profile_folder, evidence_dir):
+def analyze_history(profile_folder, evidence_dir, case_meta=None):
     db = os.path.join(profile_folder, "History")
     if not os.path.exists(db):
         return []
 
-    copied = safe_copy_db(db, evidence_dir)
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    copied = safe_copy_db(db, evidence_dir, case_meta=case_meta)
     conn = sqlite3.connect(copied)
     cur = conn.cursor()
     entries = []
@@ -187,7 +262,6 @@ def analyze_history(profile_folder, evidence_dir):
             SELECT url, title, visit_count, last_visit_time
             FROM urls
             ORDER BY last_visit_time DESC
-            LIMIT 300
         """)
         for url, title, visits, last_visit_time in cur.fetchall():
             entries.append({
@@ -197,6 +271,8 @@ def analyze_history(profile_folder, evidence_dir):
                 "last_visit": chrome_time_to_str(last_visit_time),
                 "category": classify_url(url or "")
             })
+            if max_rec and len(entries) >= max_rec:
+                break
     except Exception as e:
         logger.error(f"Error analyzing history: {str(e)}")
         entries.append({"error": str(e)})
@@ -206,12 +282,13 @@ def analyze_history(profile_folder, evidence_dir):
     return entries
 
 
-def analyze_downloads(profile_folder, evidence_dir):
+def analyze_downloads(profile_folder, evidence_dir, case_meta=None):
     db = os.path.join(profile_folder, "History")
     if not os.path.exists(db):
         return []
 
-    copied = safe_copy_db(db, evidence_dir)
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    copied = safe_copy_db(db, evidence_dir, case_meta=case_meta)
     conn = sqlite3.connect(copied)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -222,9 +299,9 @@ def analyze_downloads(profile_folder, evidence_dir):
         cur.execute("PRAGMA table_info(downloads_url_chains)")
         columns = [info[1] for info in cur.fetchall()]
         has_referrer = "referrer" in columns
-        
+
         query = f"""
-            SELECT 
+            SELECT
                 d.current_path,
                 d.target_path,
                 d.total_bytes,
@@ -236,7 +313,6 @@ def analyze_downloads(profile_folder, evidence_dir):
             FROM downloads d
             LEFT JOIN downloads_url_chains u ON d.id = u.id AND u.chain_index = 0
             ORDER BY d.start_time DESC
-            LIMIT 200
         """
         cur.execute(query)
         for r in cur.fetchall():
@@ -250,6 +326,8 @@ def analyze_downloads(profile_folder, evidence_dir):
                 "end_time": chrome_time_to_str(r["end_time"]),
                 "category": classify_url(r["source_url"] or "")
             })
+            if max_rec and len(downloads) >= max_rec:
+                break
     except sqlite3.OperationalError as e:
         logger.warning(f"Downloads schema unavailable: {str(e)}")
         downloads.append({"error": f"Downloads schema unavailable: {str(e)}"})
@@ -262,23 +340,40 @@ def analyze_downloads(profile_folder, evidence_dir):
     return downloads
 
 
-def analyze_cookies(profile_folder, evidence_dir):
+def analyze_cookies(profile_folder, evidence_dir, case_meta=None):
     db = os.path.join(profile_folder, "Cookies")
     if not os.path.exists(db):
         return []
 
-    copied = safe_copy_db(db, evidence_dir)
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    copied = safe_copy_db(db, evidence_dir, case_meta=case_meta)
     conn = sqlite3.connect(copied)
     cur = conn.cursor()
     cookies = []
 
     try:
-        cur.execute("""
-            SELECT host_key, name, value, creation_utc, last_access_utc, expires_utc, is_secure
-            FROM cookies
-            LIMIT 150
-        """)
-        for host_key, name, value, creation_utc, last_access_utc, expires_utc, is_secure in cur.fetchall():
+        # Detect available columns (schema varies between Chrome versions)
+        cur.execute("PRAGMA table_info(cookies)")
+        col_names = [r[1] for r in cur.fetchall()]
+        has_encrypted = "encrypted_value" in col_names
+
+        select_cols = "host_key, name, value, creation_utc, last_access_utc, expires_utc, is_secure"
+        if has_encrypted:
+            select_cols += ", encrypted_value"
+        cur.execute(f"SELECT {select_cols} FROM cookies")
+
+        for row in cur.fetchall():
+            host_key, name, value = row[0], row[1], row[2]
+            creation_utc, last_access_utc, expires_utc, is_secure = row[3], row[4], row[5], row[6]
+            enc_bytes = row[7] if has_encrypted else b""
+
+            enc_present = bool(enc_bytes)
+            enc_size = len(enc_bytes) if enc_bytes else 0
+            enc_sha256 = ""
+            if enc_bytes:
+                enc_sha256 = hashlib.sha256(enc_bytes).hexdigest()
+                value = "[REDACTED]"
+
             cookies.append({
                 "host_key": host_key or "",
                 "name": name or "",
@@ -286,8 +381,13 @@ def analyze_cookies(profile_folder, evidence_dir):
                 "creation_time": chrome_time_to_str(creation_utc),
                 "last_access_time": chrome_time_to_str(last_access_utc),
                 "expires_time": chrome_time_to_str(expires_utc),
-                "is_secure": bool(is_secure)
+                "is_secure": bool(is_secure),
+                "encrypted_value_present": enc_present,
+                "encrypted_value_size": enc_size,
+                "encrypted_value_sha256": enc_sha256,
             })
+            if max_rec and len(cookies) >= max_rec:
+                break
     except Exception as e:
         logger.error(f"Error analyzing cookies: {str(e)}")
         cookies.append({"error": str(e)})
@@ -297,31 +397,52 @@ def analyze_cookies(profile_folder, evidence_dir):
     return cookies
 
 
-def analyze_logins(profile_folder, evidence_dir):
+def analyze_logins(profile_folder, evidence_dir, case_meta=None):
     db = os.path.join(profile_folder, "Login Data")
     if not os.path.exists(db):
         return []
 
-    copied = safe_copy_db(db, evidence_dir)
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    copied = safe_copy_db(db, evidence_dir, case_meta=case_meta)
     conn = sqlite3.connect(copied)
     cur = conn.cursor()
     logins = []
 
     try:
-        cur.execute("""
-            SELECT origin_url, username_value, date_created, date_last_used, times_used
-            FROM logins
-            LIMIT 150
-        """)
-        for origin_url, username_value, date_created, date_last_used, times_used in cur.fetchall():
+        # Detect available columns
+        cur.execute("PRAGMA table_info(logins)")
+        col_names = [r[1] for r in cur.fetchall()]
+        has_password_value = "password_value" in col_names
+
+        select_cols = "origin_url, username_value, date_created, date_last_used, times_used"
+        if has_password_value:
+            select_cols += ", password_value"
+        cur.execute(f"SELECT {select_cols} FROM logins")
+
+        for row in cur.fetchall():
+            origin_url, username_value = row[0], row[1]
+            date_created, date_last_used, times_used = row[2], row[3], row[4]
+            pw_bytes = row[5] if has_password_value else b""
+
+            pw_encrypted = bool(pw_bytes)
+            pw_size = len(pw_bytes) if pw_bytes else 0
+            pw_sha256 = ""
+            if pw_bytes:
+                pw_sha256 = hashlib.sha256(pw_bytes).hexdigest()
+
             logins.append({
                 "origin_url": origin_url or "",
                 "username_value": username_value or "",
                 "password_value": "[ENCRYPTED via DPAPI]",
+                "password_encrypted": pw_encrypted,
+                "password_value_size": pw_size,
+                "password_value_sha256": pw_sha256,
                 "date_created": chrome_time_to_str(date_created),
                 "date_last_used": chrome_time_to_str(date_last_used),
-                "times_used": times_used or 0
+                "times_used": times_used or 0,
             })
+            if max_rec and len(logins) >= max_rec:
+                break
     except Exception as e:
         logger.error(f"Error analyzing logins: {str(e)}")
         logins.append({"error": str(e)})
@@ -331,20 +452,20 @@ def analyze_logins(profile_folder, evidence_dir):
     return logins
 
 
-def analyze_topsites(profile_folder, evidence_dir):
+def analyze_topsites(profile_folder, evidence_dir, case_meta=None):
     db = os.path.join(profile_folder, "Top Sites")
     if not os.path.exists(db):
         return []
 
-    copied = safe_copy_db(db, evidence_dir)
+    copied = safe_copy_db(db, evidence_dir, case_meta=case_meta)
     conn = sqlite3.connect(copied)
     cur = conn.cursor()
     topsites = []
 
     try:
         for sql in (
-            "SELECT url, title FROM top_sites LIMIT 100",
-            "SELECT url, title FROM thumbnails LIMIT 100",
+            "SELECT url, title FROM top_sites",
+            "SELECT url, title FROM thumbnails",
         ):
             try:
                 cur.execute(sql)
@@ -396,7 +517,8 @@ def analyze_bookmarks(profile_folder):
                 walk(item, folder_name)
 
     walk(raw)
-    return bookmarks[:300]
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    return bookmarks[:max_rec] if max_rec else bookmarks
 
 
 def analyze_preferences(profile_folder):
@@ -426,12 +548,12 @@ def analyze_preferences(profile_folder):
         return [{"error": str(e)}]
 
 
-def analyze_webdata(profile_folder, evidence_dir):
+def analyze_webdata(profile_folder, evidence_dir, case_meta=None):
     db = os.path.join(profile_folder, "Web Data")
     if not os.path.exists(db):
         return []
 
-    copied = safe_copy_db(db, evidence_dir)
+    copied = safe_copy_db(db, evidence_dir, case_meta=case_meta)
     conn = sqlite3.connect(copied)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -443,7 +565,6 @@ def analyze_webdata(profile_folder, evidence_dir):
                 SELECT name, value, date_created, date_last_used, count
                 FROM autofill
                 ORDER BY date_last_used DESC
-                LIMIT 120
             """)
             for r in cur.fetchall():
                 rows.append({
@@ -461,7 +582,6 @@ def analyze_webdata(profile_folder, evidence_dir):
             cur.execute("""
                 SELECT guid, company_name, street_address, city, state, zipcode, country_code, date_modified
                 FROM autofill_profiles
-                LIMIT 80
             """)
             for r in cur.fetchall():
                 rows.append({
@@ -535,15 +655,16 @@ def analyze_extensions(profile_folder):
     except Exception as e:
         rows.append({"error": str(e)})
 
-    return rows[:200]
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    return rows[:max_rec] if max_rec else rows
 
 
-def analyze_favicons(profile_folder, evidence_dir):
+def analyze_favicons(profile_folder, evidence_dir, case_meta=None):
     db = os.path.join(profile_folder, "Favicons")
     if not os.path.exists(db):
         return []
 
-    copied = safe_copy_db(db, evidence_dir)
+    copied = safe_copy_db(db, evidence_dir, case_meta=case_meta)
     conn = sqlite3.connect(copied)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -556,9 +677,8 @@ def analyze_favicons(profile_folder, evidence_dir):
             FROM icon_mapping i
             LEFT JOIN favicons f ON i.icon_id = f.id
             LEFT JOIN favicon_bitmaps b ON f.id = b.icon_id
-            LIMIT 150
             """,
-            "SELECT page_url, icon_url, 0 as last_updated, 0 as width, 0 as height FROM icon_mapping LIMIT 150",
+            "SELECT page_url, icon_url, 0 as last_updated, 0 as width, 0 as height FROM icon_mapping",
         ]
         for q in queries:
             try:
@@ -603,7 +723,8 @@ def analyze_sessions(profile_folder):
         rows.append({"error": str(e)})
 
     rows.sort(key=lambda x: x.get("modified_time", ""), reverse=True)
-    return rows[:100]
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    return rows[:max_rec] if max_rec else rows
 
 
 def analyze_local_storage(profile_folder):
@@ -627,7 +748,8 @@ def analyze_local_storage(profile_folder):
         rows.append({"error": str(e)})
 
     rows.sort(key=lambda x: x.get("modified_time", ""), reverse=True)
-    return rows[:200]
+    max_rec = load_settings().get("max_records_per_artifact", 0) or 0
+    return rows[:max_rec] if max_rec else rows
 
 
 def analyze_deleted_records(profile_folder, evidence_dir):
@@ -667,15 +789,14 @@ def analyze_deleted_records(profile_folder, evidence_dir):
                     "risk": "Sensitive" if size > 0 else "Info",
                 })
 
-        # --- 2. ID gap analysis (History only) ---
         if db_name == "History" and table == "urls":
+            conn = None
             try:
                 copied = safe_copy_db(db_path, evidence_dir)
                 conn = sqlite3.connect(copied)
                 cur = conn.cursor()
                 cur.execute(f"SELECT {id_col} FROM {table} ORDER BY {id_col} ASC")
                 ids = [row[0] for row in cur.fetchall()]
-                conn.close()
 
                 gaps = []
                 for i in range(1, len(ids)):
@@ -702,6 +823,9 @@ def analyze_deleted_records(profile_folder, evidence_dir):
                     })
             except Exception as e:
                 logger.warning(f"ID gap analysis failed for {db_name}: {e}")
+            finally:
+                if conn:
+                    conn.close()
 
     results.sort(key=lambda x: x.get("risk", "Info"), reverse=True)
     return results[:100]
@@ -945,6 +1069,7 @@ def generate_rule_based_summary(data, findings):
         "favicons",
         "sessions",
         "local_storage",
+        "deleted_records",
     ]:
         label = key.replace("_", " ").title()
         lines.append(f"- {label} entries: {len(data.get(key, []))}")
@@ -1010,30 +1135,71 @@ def _redact_value(key, value):
     return value
 
 
-def sanitize_record_for_ai(record):
-    """Create a minimal AI-safe copy of a parsed artifact record."""
-    if not isinstance(record, dict):
+def sanitize_text_for_ai(text):
+    if not isinstance(text, str):
+        return text
+
+    import re
+    def clean_url(match):
+        u = match.group(0)
+        try:
+            p = urlparse(u)
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}{p.path}"
+        except Exception:
+            pass
+        return u
+
+    cleaned_text = re.sub(r'https?://[^\s]+', clean_url, text)
+
+    redact_patterns = [
+        r'(?i)\b(access_token|refresh_token|token|password|secret|key|user)\s*=\s*[^\s&]+'
+    ]
+    for pattern in redact_patterns:
+        cleaned_text = re.sub(pattern, r'\1=[REDACTED]', cleaned_text)
+
+    return cleaned_text[:500]
+
+
+def sanitize_record_for_ai(record, parent_key=None):
+    """Create a minimal AI-safe copy of a parsed artifact record recursively."""
+    if isinstance(record, dict):
+        cleaned = {}
+        for key, value in record.items():
+            key_l = str(key).lower()
+            if key_l in {"url", "source_url", "origin_url", "referrer", "page_url", "icon_url"}:
+                cleaned[key] = _safe_url_for_ai(value) if isinstance(value, str) else value
+                cleaned[f"{key}_domain"] = _safe_domain(value) if isinstance(value, str) else ""
+            else:
+                cleaned[key] = sanitize_record_for_ai(value, parent_key=key)
+        return cleaned
+    elif isinstance(record, list):
+        return [sanitize_record_for_ai(item, parent_key=parent_key) for item in record]
+    elif isinstance(record, str):
+        key_to_check = parent_key if parent_key is not None else "value"
+        val = _redact_value(key_to_check, record)
+        if val != "[REDACTED]":
+            val = sanitize_text_for_ai(val)
+        return val
+    else:
         return record
-
-    cleaned = {}
-    for key, value in record.items():
-        key_l = str(key).lower()
-
-        if key_l in {"url", "source_url", "origin_url", "referrer", "page_url", "icon_url"}:
-            cleaned[key] = _safe_url_for_ai(value) if isinstance(value, str) else value
-            cleaned[f"{key}_domain"] = _safe_domain(value) if isinstance(value, str) else ""
-            continue
-
-        cleaned[key] = _redact_value(key, value)
-
-    return cleaned
 
 
 def build_ai_prompt_data(data, findings, max_items=50):
     """Prepare a prioritized, privacy-aware forensic context for the AI model."""
+    sanitized_findings = []
+    for item in findings[:100]:
+        if not isinstance(item, dict):
+            continue
+        sanitized_findings.append({
+            "severity": item.get("severity", "Notable"),
+            "title": sanitize_text_for_ai(item.get("title", "")),
+            "details": sanitize_text_for_ai(item.get("details", "")),
+        })
+
     safe_data = {
         "counts": {k: len(v) for k, v in data.items() if isinstance(v, list)},
-        "findings": findings[:100],  # Include up to 100 findings for a richer context
+        "findings": sanitized_findings,
         "artifacts": {},
         "analysis_rules": [
             "Act as an expert digital forensics investigator (GCFE/GCFA style).",
@@ -1226,7 +1392,7 @@ def initialize_case(case_id, investigator="Unknown", notes=""):
         "created_at": now_utc(),
         "case_dir": case_dir,
         "evidence_dir": evidence_dir,
-        "chain_log_path": os.path.join(case_dir, "chain_of_custody.log")
+        "chain_log_path": os.path.join(case_dir, "chain_log.txt")
     }
     
     with open(os.path.join(case_dir, "case_info.json"), "w") as f:
@@ -1239,14 +1405,39 @@ def export_json(case_dir, case_id, data, timeline, findings, summary):
     path = os.path.join(case_dir, f"{case_id}_analysis.json")
     payload = {
         "case_id": case_id,
-        "generated_at": now_utc(),
         "data": data,
         "timeline": timeline,
         "findings": findings,
         "summary": summary,
     }
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+        
+    json_sha256 = generate_sha256(path)
+    
+    # export_metadata.json sidecar
+    meta_path = os.path.join(case_dir, "export_metadata.json")
+    meta_payload = {
+        "case_id": case_id,
+        "generated_at": now_utc(),
+        "report_sha256": json_sha256,
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta_payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+        
+    # output_hashes.json
+    output_hashes_path = os.path.join(case_dir, "output_hashes.json")
+    hashes_dict = {}
+    if os.path.exists(output_hashes_path):
+        try:
+            with open(output_hashes_path, "r", encoding="utf-8") as hf:
+                hashes_dict = json.load(hf)
+        except Exception:
+            pass
+    hashes_dict["json_report_sha256"] = json_sha256
+    with open(output_hashes_path, "w", encoding="utf-8") as hf:
+        json.dump(hashes_dict, hf, indent=2, ensure_ascii=False, sort_keys=True)
+        
     return path
 
 
@@ -1504,7 +1695,7 @@ def export_pdf(case_dir, case_id, data, findings, summary):
     for key in [
         "history", "downloads", "cookies", "logins", "topsites", 
         "bookmarks", "preferences", "webdata", "extensions", 
-        "favicons", "sessions", "local_storage"
+        "favicons", "sessions", "local_storage", "deleted_records"
     ]:
         stats_data.append([key.replace('_', ' ').title(), len(data.get(key, []))])
     
@@ -1593,9 +1784,23 @@ def export_pdf(case_dir, case_id, data, findings, summary):
         except Exception:
             pass
 
+    pdf_sha256 = generate_sha256(path)
     hash_path = os.path.join(case_dir, "report_sha256.txt")
     with open(hash_path, "w", encoding="utf-8") as f:
-        f.write(generate_sha256(path))
+        f.write(pdf_sha256)
+
+    # Write output_hashes.json
+    output_hashes_path = os.path.join(case_dir, "output_hashes.json")
+    hashes_dict = {}
+    if os.path.exists(output_hashes_path):
+        try:
+            with open(output_hashes_path, "r", encoding="utf-8") as hf:
+                hashes_dict = json.load(hf)
+        except Exception:
+            pass
+    hashes_dict["pdf_report_sha256"] = pdf_sha256
+    with open(output_hashes_path, "w", encoding="utf-8") as hf:
+        json.dump(hashes_dict, hf, indent=2, ensure_ascii=False, sort_keys=True)
 
     return path
 
@@ -1609,15 +1814,17 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
     # Build Navigation
     nav_links = []
     for k in counts.keys():
-        nav_links.append(f'<a href="#section-{k.replace(" ", "-")}" class="nav-item flex items-center gap-4 p-4 rounded-xl text-slate-400 font-semibold"><i class="fas fa-folder-open w-5"></i> {k}</a>')
+        k_esc = html.escape(k)
+        nav_links.append(f'<a href="#section-{k_esc.replace(" ", "-")}" class="nav-item flex items-center gap-4 p-4 rounded-xl text-slate-400 font-semibold"><i class="fas fa-folder-open w-5"></i> {k_esc}</a>')
     nav_html = "".join(nav_links)
 
     # Build Dashboard Cards
     stat_cards = []
     for k, v in counts.items():
+        k_esc = html.escape(k)
         stat_cards.append(f'''
             <div class="glass p-8 rounded-3xl stat-card">
-                <div class="text-slate-500 text-xs font-bold mb-2 uppercase tracking-[0.2em]">{k}</div>
+                <div class="text-slate-500 text-xs font-bold mb-2 uppercase tracking-[0.2em]">{k_esc}</div>
                 <div class="text-4xl font-black text-white">{v}</div>
             </div>
         ''')
@@ -1631,13 +1838,17 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
         bg_color = "bg-amber-500/5" if severity == "Sensitive" else "bg-blue-500/5"
         icon = "<i class='fas fa-triangle-exclamation text-amber-500'></i>" if severity == "Sensitive" else "<i class='fas fa-circle-info text-blue-500'></i>"
         
+        f_title = html.escape(f.get("title") or "")
+        f_details = html.escape(f.get("details") or "")
+        f_sev = html.escape(severity)
+        
         findings_html_list.append(f'''
             <div class="glass {bg_color} p-6 rounded-2xl border-l-4 {border_color} flex items-start gap-5">
                 <div class="mt-1 text-xl">{icon}</div>
                 <div>
-                    <div class="font-bold text-lg text-white mb-1">{f.get("title")}</div>
-                    <div class="text-slate-400 text-sm leading-relaxed">{f.get("details")}</div>
-                    <div class="inline-block px-2 py-1 rounded-md bg-slate-800 text-[10px] mt-3 uppercase font-black tracking-widest text-slate-500">SEVERITY: {severity}</div>
+                    <div class="font-bold text-lg text-white mb-1">{f_title}</div>
+                    <div class="text-slate-400 text-sm leading-relaxed">{f_details}</div>
+                    <div class="inline-block px-2 py-1 rounded-md bg-slate-800 text-[10px] mt-3 uppercase font-black tracking-widest text-slate-500">SEVERITY: {f_sev}</div>
                 </div>
             </div>
         ''')
@@ -1646,7 +1857,11 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
     # Build Timeline Rows
     timeline_rows = []
     for t in timeline:
-        timeline_rows.append(f"<tr><td>{t.get('time')}</td><td>{t.get('artifact')}</td><td>{t.get('event')}</td><td>{t.get('details')}</td></tr>")
+        t_time = html.escape(t.get('time') or "")
+        t_art = html.escape(t.get('artifact') or "")
+        t_evt = html.escape(t.get('event') or "")
+        t_det = html.escape(t.get('details') or "")
+        timeline_rows.append(f"<tr><td>{t_time}</td><td>{t_art}</td><td>{t_evt}</td><td>{t_det}</td></tr>")
     timeline_html = "".join(timeline_rows)
 
     # Build Sections
@@ -1654,17 +1869,18 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
     for k, count in counts.items():
         key_raw = k.lower().replace(" ", "_")
         artifact_data = data.get(key_raw, [])
+        k_esc = html.escape(k)
         
         if artifact_data and isinstance(artifact_data[0], dict):
             # Collect all unique keys across all dictionaries to handle different schemas safely
             all_keys = []
             for row in artifact_data:
                 if isinstance(row, dict):
-                    for k in row.keys():
-                        if k not in all_keys:
-                            all_keys.append(k)
+                    for rk in row.keys():
+                        if rk not in all_keys:
+                            all_keys.append(rk)
             
-            header_html = "".join([f"<th>{c.replace('_', ' ').title()}</th>" for c in all_keys])
+            header_html = "".join([f"<th>{html.escape(c.replace('_', ' ').title())}</th>" for c in all_keys])
             body_rows = []
             for row in artifact_data:
                 if not isinstance(row, dict): continue
@@ -1672,15 +1888,16 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
                 row_style = "style='background: rgba(239, 68, 68, 0.05); color: #fca5a5;'" if is_suspicious else ""
                 
                 cells_list = []
-                for k in all_keys:
-                    val = row.get(k, "")
+                for rk in all_keys:
+                    val = row.get(rk, "")
                     val_str = str(val)
+                    val_esc = html.escape(val_str)
                     if len(val_str) > 100 and (val_str.startswith("http://") or val_str.startswith("https://")):
-                        cells_list.append(f"<td><a href='{val_str}' target='_blank' class='text-blue-400 hover:underline' title='{val_str}'>{val_str[:60]}...</a></td>")
+                        cells_list.append(f"<td><a href='{val_esc}' target='_blank' class='text-blue-400 hover:underline' title='{val_esc}'>{val_esc[:60]}...</a></td>")
                     elif len(val_str) > 150:
-                        cells_list.append(f"<td title='{val_str}'>{val_str[:120]}...</td>")
+                        cells_list.append(f"<td title='{val_esc}'>{val_esc[:120]}...</td>")
                     else:
-                        cells_list.append(f"<td>{val_str}</td>")
+                        cells_list.append(f"<td>{val_esc}</td>")
                 cells = "".join(cells_list)
                 body_rows.append(f"<tr {row_style}>{cells}</tr>")
             body_html = "".join(body_rows)
@@ -1689,10 +1906,10 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
             body_html = "<tr><td>No data available or error occurred</td></tr>"
 
         sections_list.append(f'''
-        <div id="section-{k.replace(" ", "-")}" class="glass rounded-3xl p-8 mb-12">
+        <div id="section-{k_esc.replace(" ", "-")}" class="glass rounded-3xl p-8 mb-12">
             <div class="flex items-center justify-between mb-8">
                 <h3 class="text-2xl font-bold flex items-center gap-3">
-                    <i class="fas fa-layer-group text-blue-500"></i> {k} Artifacts
+                    <i class="fas fa-layer-group text-blue-500"></i> {k_esc} Artifacts
                 </h3>
                 <span class="text-xs font-bold text-slate-500 bg-slate-800 px-3 py-1 rounded-full uppercase tracking-widest">Count: {count}</span>
             </div>
@@ -1709,6 +1926,7 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
     # Final Assembly
     logo_b64 = get_logo_base64()
     logo_src = f"data:image/png;base64,{logo_b64}" if logo_b64 else "https://cdn-icons-png.flaticon.com/512/9439/9439311.png"
+    summary_esc = html.escape(summary or "")
     
     html_template = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1950,7 +2168,7 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
                     <i class="fas fa-wand-magic-sparkles"></i> AI Analyst Intelligence Summary
                 </h3>
                 <div class="text-slate-300 leading-relaxed text-lg whitespace-pre-wrap font-medium relative z-10">
-                    {summary}
+                    {summary_esc}
                 </div>
             </div>
         </div>
@@ -2071,29 +2289,27 @@ def export_html(case_dir, case_id, data, timeline, findings, summary):
     return path
 
 
-
-
 def run_full_analysis(profile_folder, case_meta, log_callback=None):
     data = {}
     analyzers = [
-        ("history", analyze_history, (profile_folder, case_meta["evidence_dir"])),
-        ("downloads", analyze_downloads, (profile_folder, case_meta["evidence_dir"])),
-        ("cookies", analyze_cookies, (profile_folder, case_meta["evidence_dir"])),
-        ("logins", analyze_logins, (profile_folder, case_meta["evidence_dir"])),
-        ("topsites", analyze_topsites, (profile_folder, case_meta["evidence_dir"])),
-        ("bookmarks", analyze_bookmarks, (profile_folder,)),
-        ("preferences", analyze_preferences, (profile_folder,)),
-        ("webdata", analyze_webdata, (profile_folder, case_meta["evidence_dir"])),
-        ("extensions", analyze_extensions, (profile_folder,)),
-        ("favicons", analyze_favicons, (profile_folder, case_meta["evidence_dir"])),
-        ("sessions", analyze_sessions, (profile_folder,)),
-        ("local_storage", analyze_local_storage, (profile_folder,)),
-        ("deleted_records", analyze_deleted_records, (profile_folder, case_meta["evidence_dir"])),
+        ("history", analyze_history, (profile_folder, case_meta["evidence_dir"]), {"case_meta": case_meta}),
+        ("downloads", analyze_downloads, (profile_folder, case_meta["evidence_dir"]), {"case_meta": case_meta}),
+        ("cookies", analyze_cookies, (profile_folder, case_meta["evidence_dir"]), {"case_meta": case_meta}),
+        ("logins", analyze_logins, (profile_folder, case_meta["evidence_dir"]), {"case_meta": case_meta}),
+        ("topsites", analyze_topsites, (profile_folder, case_meta["evidence_dir"]), {"case_meta": case_meta}),
+        ("bookmarks", analyze_bookmarks, (profile_folder,), {}),
+        ("preferences", analyze_preferences, (profile_folder,), {}),
+        ("webdata", analyze_webdata, (profile_folder, case_meta["evidence_dir"]), {"case_meta": case_meta}),
+        ("extensions", analyze_extensions, (profile_folder,), {}),
+        ("favicons", analyze_favicons, (profile_folder, case_meta["evidence_dir"]), {"case_meta": case_meta}),
+        ("sessions", analyze_sessions, (profile_folder,), {}),
+        ("local_storage", analyze_local_storage, (profile_folder,), {}),
+        ("deleted_records", analyze_deleted_records, (profile_folder, case_meta["evidence_dir"]), {}),
     ]
 
-    for key, fn, args in analyzers:
+    for key, fn, args, kwargs in analyzers:
         try:
-            result = fn(*args)
+            result = fn(*args, **kwargs)
             data[key] = result
             if log_callback:
                 log_callback(f"{key.replace('_', ' ').title()} analyzed ({len(result)} entries).")
@@ -2105,7 +2321,24 @@ def run_full_analysis(profile_folder, case_meta, log_callback=None):
     findings = build_findings(data)
     findings.extend(detect_high_risk_downloads(data.get("downloads", [])))
 
-    # 4. Keyword Detection for Findings
+    # Convert Sensitive deleted_records entries into findings
+    for dr in data.get("deleted_records", []):
+        if not isinstance(dr, dict):
+            continue
+        if dr.get("risk") == "Sensitive":
+            findings.append({
+                "severity": "Sensitive",
+                "title": "Deleted Record Indicator Observed",
+                "details": (
+                    f"Database: {dr.get('database', 'N/A')} | "
+                    f"Type: {dr.get('file_type', 'N/A')} | "
+                    f"File: {dr.get('file', 'N/A')} | "
+                    f"Size: {dr.get('size_bytes', 0):,} bytes | "
+                    f"Note: {dr.get('note', '')}"
+                ),
+            })
+
+    # Keyword Detection for Findings
     seen_findings = set()
     kw_match_count = 0
     max_kw_findings = 10
