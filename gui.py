@@ -1,3 +1,4 @@
+import os
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 import threading
@@ -25,6 +26,7 @@ from core import (
     export_history_csv,
     export_pdf,
     export_html,
+    export_xlsx,
     check_keywords,
     get_category_stats,
     get_activity_timeline_stats
@@ -186,7 +188,7 @@ class ForensicTool:
 
         tk.Label(
             left,
-            text=f"Digital Forensics & Chrome Evidence Analysis Workspace - AgentRouter / Claude | Model: {AI_MODEL}",
+            text=f"Digital Forensics & Chrome Evidence Analysis Workspace - OpenRouter AI | Model: {AI_MODEL}",
             fg="#9fb3c8",
             bg="#111b2b",
             font=("Segoe UI", 10),
@@ -248,7 +250,7 @@ class ForensicTool:
 
         tk.Label(
             right_card,
-            text="OpenAI (GPT-4o) Integration",
+            text="OpenRouter / OpenAI-Compatible AI Integration",
             fg="#e2e8f0",
             bg="#162233",
             font=("Segoe UI", 11, "bold"),
@@ -257,9 +259,14 @@ class ForensicTool:
         api_row = tk.Frame(right_card, bg="#162233")
         api_row.pack(fill="x", padx=12, pady=(0, 4))
 
-        # Load OpenAI key first, fallback to legacy key if exists
-        saved_key = self.settings.get("openai_api_key", self.settings.get("anthropic_api_key", ""))
+        # Load OpenRouter key first, then fallback to legacy keys if they exist.
+        saved_key = self.settings.get(
+            "openrouter_api_key",
+            self.settings.get("openai_api_key", self.settings.get("anthropic_api_key", ""))
+        )
         self.api_var = tk.StringVar(value=saved_key)
+        self.ai_model_var = tk.StringVar(value=self.settings.get("ai_model", AI_MODEL))
+        self.ai_base_url_var = tk.StringVar(value=self.settings.get("ai_base_url", AI_BASE_URL))
         self.api_entry = tk.Entry(
             api_row,
             textvariable=self.api_var,
@@ -287,13 +294,31 @@ class ForensicTool:
             cursor="hand2",
         ).pack(side="left", padx=(8, 0))
 
-        tk.Label(
-            right_card,
-            text=f"Base URL: {AI_BASE_URL} | Model: {AI_MODEL}",
-            fg="#94a3b8",
-            bg="#162233",
+        model_row = tk.Frame(right_card, bg="#162233")
+        model_row.pack(fill="x", padx=12, pady=(4, 4))
+
+        tk.Label(model_row, text="Model:", fg="#94a3b8", bg="#162233", font=("Consolas", 9)).pack(side="left")
+        tk.Entry(
+            model_row,
+            textvariable=self.ai_model_var,
+            bg="#0f1720",
+            fg="white",
+            insertbackground="white",
+            relief="flat",
             font=("Consolas", 9),
-        ).pack(anchor="w", padx=12, pady=(0, 8))
+            width=28,
+        ).pack(side="left", padx=(6, 10), ipady=4)
+
+        tk.Label(model_row, text="Base URL:", fg="#94a3b8", bg="#162233", font=("Consolas", 9)).pack(side="left")
+        tk.Entry(
+            model_row,
+            textvariable=self.ai_base_url_var,
+            bg="#0f1720",
+            fg="white",
+            insertbackground="white",
+            relief="flat",
+            font=("Consolas", 9),
+        ).pack(side="left", fill="x", expand=True, padx=(6, 0), ipady=4)
 
     def _button(self, parent, text, command, color):
         btn = tk.Button(
@@ -363,6 +388,7 @@ class ForensicTool:
         self._button(bar, "Export HTML Report", self.export_html_report, "#2563eb").pack(side="left", padx=4)
         self._button(bar, "Export PDF", self.export_pdf_report, "#b45309").pack(side="left", padx=4)
         self._button(bar, "Export JSON", self.export_json_bundle, "#1d4ed8").pack(side="left", padx=4)
+        self._button(bar, "Export XLSX", self.export_xlsx_report, "#15803d").pack(side="left", padx=4)
         self._button(bar, "Export Timeline CSV", self.export_timeline_report, "#475569").pack(side="left", padx=4)
         self._button(bar, "Export History CSV", self.export_history_report, "#475569").pack(side="left", padx=4)
 
@@ -396,6 +422,7 @@ class ForensicTool:
             "favicons",
             "sessions",
             "local_storage",
+            "deleted_records",
         ]
         accents = [
             "#1d4ed8",
@@ -410,6 +437,7 @@ class ForensicTool:
             "#0ea5e9",
             "#7c2d12",
             "#374151",
+            "#dc2626",
         ]
 
         self.stat_vars = {}
@@ -451,23 +479,26 @@ class ForensicTool:
         self.tabs = ttk.Notebook(parent)
         self.tabs.pack(fill="both", expand=True)
 
-        self.evidence_tab = tk.Frame(self.tabs, bg="#162233")
-        self.dashboard_tab = tk.Frame(self.tabs, bg="#162233")
-        self.summary_tab = tk.Frame(self.tabs, bg="#162233")
-        self.timeline_tab = tk.Frame(self.tabs, bg="#162233")
-        self.chain_tab = tk.Frame(self.tabs, bg="#162233")
+        self.evidence_tab    = tk.Frame(self.tabs, bg="#162233")
+        self.dashboard_tab   = tk.Frame(self.tabs, bg="#162233")
+        self.summary_tab     = tk.Frame(self.tabs, bg="#162233")
+        self.timeline_tab    = tk.Frame(self.tabs, bg="#162233")
+        self.chain_tab       = tk.Frame(self.tabs, bg="#162233")
+        self.compare_tab     = tk.Frame(self.tabs, bg="#162233")
 
-        self.tabs.add(self.evidence_tab, text="Evidence Explorer")
+        self.tabs.add(self.evidence_tab,  text="Evidence Explorer")
         self.tabs.add(self.dashboard_tab, text="Dashboard (Charts)")
-        self.tabs.add(self.summary_tab, text="Analyst Summary")
-        self.tabs.add(self.timeline_tab, text="Timeline")
-        self.tabs.add(self.chain_tab, text="Chain Log")
+        self.tabs.add(self.summary_tab,   text="Analyst Summary")
+        self.tabs.add(self.timeline_tab,  text="Timeline")
+        self.tabs.add(self.chain_tab,     text="Chain Log")
+        self.tabs.add(self.compare_tab,   text="⚖ Case Compare")
 
         self._build_evidence_tab()
         self._build_dashboard_tab()
         self._build_summary_tab()
         self._build_timeline_tab()
         self._build_chain_tab()
+        self._build_compare_tab()
 
     def _build_evidence_tab(self):
         tree_frame = tk.Frame(self.evidence_tab, bg="#162233")
@@ -530,7 +561,7 @@ class ForensicTool:
             ("event", "Event", 170),
             ("details", "Details", 560),
         ]:
-            self.timeline_tree.heading(col, text=title)
+            self.timeline_tree.heading(col, text=title, command=lambda c=col: self._sort_timeline(c, False))
             self.timeline_tree.column(col, width=width, anchor="w")
 
         yscroll = ttk.Scrollbar(frame, orient="vertical", command=self.timeline_tree.yview)
@@ -538,6 +569,27 @@ class ForensicTool:
         self.timeline_tree.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
         self.timeline_tree.tag_configure("suspicious", foreground="#ef4444")
+
+    def _sort_timeline(self, col, reverse):
+        """Sorts the timeline treeview by the clicked column header."""
+        l = [(self.timeline_tree.set(k, col), k) for k in self.timeline_tree.get_children("")]
+        l.sort(reverse=reverse)
+
+        for index, (val, k) in enumerate(l):
+            self.timeline_tree.move(k, "", index)
+
+        headers_map = {
+            "time": "Time",
+            "artifact": "Artifact",
+            "event": "Event",
+            "details": "Details"
+        }
+        for c_key, c_title in headers_map.items():
+            if c_key == col:
+                indicator = " ▼" if reverse else " ▲"
+                self.timeline_tree.heading(c_key, text=c_title + indicator, command=lambda c=c_key: self._sort_timeline(c, not reverse))
+            else:
+                self.timeline_tree.heading(c_key, text=c_title, command=lambda c=c_key: self._sort_timeline(c, False))
 
     def _build_chain_tab(self):
         self.chain_text = tk.Text(
@@ -550,6 +602,141 @@ class ForensicTool:
             relief="flat",
         )
         self.chain_text.pack(fill="both", expand=True, padx=10, pady=10)
+
+    # ------------------------------------------------------------------ #
+    # Feature 7 — Case Comparison Tab
+    # ------------------------------------------------------------------ #
+    def _build_compare_tab(self):
+        """Build the Case Comparison tab UI."""
+        top = tk.Frame(self.compare_tab, bg="#162233")
+        top.pack(fill="x", padx=14, pady=12)
+
+        tk.Label(
+            top, text="⚖  Case Comparison",
+            fg="#7dd3fc", bg="#162233",
+            font=("Segoe UI", 14, "bold")
+        ).pack(side="left")
+
+        self._button(
+            top, "Load Comparison Case (JSON)",
+            self.load_compare_case, "#1d4ed8"
+        ).pack(side="right", padx=6)
+
+        self._button(
+            top, "Clear",
+            self.clear_compare, "#475569"
+        ).pack(side="right")
+
+        # Label showing which file is loaded
+        self.compare_file_var = tk.StringVar(value="No comparison case loaded.")
+        tk.Label(
+            self.compare_tab,
+            textvariable=self.compare_file_var,
+            fg="#94a3b8", bg="#162233",
+            font=("Consolas", 9)
+        ).pack(anchor="w", padx=14, pady=(0, 6))
+
+        # Counts comparison table
+        compare_frame = tk.Frame(self.compare_tab, bg="#162233")
+        compare_frame.pack(fill="both", expand=True, padx=14, pady=6)
+
+        cols = ("artifact", "current_case", "compare_case", "diff")
+        self.compare_tree = ttk.Treeview(
+            compare_frame, columns=cols, show="headings", height=16
+        )
+        for col, title, width in [
+            ("artifact",      "Artifact",          160),
+            ("current_case",  "Current Case",      130),
+            ("compare_case",  "Compared Case",     130),
+            ("diff",          "Δ Difference",      120),
+        ]:
+            self.compare_tree.heading(col, text=title)
+            self.compare_tree.column(col, width=width, anchor="center")
+
+        self.compare_tree.tag_configure("more",  foreground="#4ade80")
+        self.compare_tree.tag_configure("less",  foreground="#f87171")
+        self.compare_tree.tag_configure("same",  foreground="#94a3b8")
+
+        ys = ttk.Scrollbar(compare_frame, orient="vertical",
+                           command=self.compare_tree.yview)
+        self.compare_tree.configure(yscrollcommand=ys.set)
+        self.compare_tree.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+
+        # Findings comparison
+        tk.Label(
+            self.compare_tab,
+            text="Findings in Comparison Case",
+            fg="#e2e8f0", bg="#162233",
+            font=("Segoe UI", 10, "bold")
+        ).pack(anchor="w", padx=14, pady=(10, 4))
+
+        self.compare_findings_list = tk.Listbox(
+            self.compare_tab,
+            bg="#0f1720", fg="white",
+            selectbackground="#1d4ed8",
+            relief="flat", font=("Segoe UI", 9),
+            height=7
+        )
+        self.compare_findings_list.pack(fill="x", padx=14, pady=(0, 12))
+
+        self._compare_data = None
+
+    def load_compare_case(self):
+        """Load a previously exported JSON bundle for comparison."""
+        import json as _json
+        path = filedialog.askopenfilename(
+            title="Select Comparison Case JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                bundle = _json.load(f)
+            self._compare_data = bundle
+            self.compare_file_var.set(f"Loaded: {path}")
+            self._refresh_compare_view()
+            self.log_chain_event(f"Comparison case loaded: {path}")
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+
+    def _refresh_compare_view(self):
+        """Populate the comparison treeview."""
+        if not self._compare_data:
+            return
+        compare_data = self._compare_data.get("data", {})
+        compare_findings = self._compare_data.get("findings", [])
+
+        self.compare_tree.delete(*self.compare_tree.get_children())
+        for artifact in [
+            "history", "downloads", "cookies", "logins", "topsites",
+            "bookmarks", "preferences", "webdata", "extensions",
+            "favicons", "sessions", "local_storage", "deleted_records"
+        ]:
+            cur_count  = len(self.data.get(artifact, []))
+            comp_count = len(compare_data.get(artifact, []))
+            diff = cur_count - comp_count
+            tag = "more" if diff > 0 else ("less" if diff < 0 else "same")
+            diff_str = f"+{diff}" if diff > 0 else str(diff)
+            self.compare_tree.insert(
+                "", "end",
+                values=(artifact.replace("_", " ").title(), cur_count, comp_count, diff_str),
+                tags=(tag,)
+            )
+
+        self.compare_findings_list.delete(0, tk.END)
+        for f in compare_findings:
+            self.compare_findings_list.insert(
+                tk.END,
+                f"[{f.get('severity','?')}] {f.get('title','')}"
+            )
+
+    def clear_compare(self):
+        self._compare_data = None
+        self.compare_file_var.set("No comparison case loaded.")
+        self.compare_tree.delete(*self.compare_tree.get_children())
+        self.compare_findings_list.delete(0, tk.END)
 
     def _build_right_panel(self, parent):
         frame = tk.Frame(parent, bg="#162233", highlightthickness=1, highlightbackground="#22344a")
@@ -614,14 +801,17 @@ class ForensicTool:
 
     def save_api_key(self):
         key_val = self.api_var.get().strip()
+        self.settings["openrouter_api_key"] = key_val
+        self.settings["ai_model"] = self.ai_model_var.get().strip() or AI_MODEL
+        self.settings["ai_base_url"] = self.ai_base_url_var.get().strip() or AI_BASE_URL
+        # Keep legacy key names for backward compatibility, but prefer openrouter_api_key.
         self.settings["openai_api_key"] = key_val
-        self.settings["anthropic_api_key"] = key_val  # Keep for backward compatibility
         self.settings["last_case_id"] = self.case_meta["case_id"]
         if self.folder:
             self.settings["last_folder"] = self.folder
         save_settings(self.settings)
-        self.log_chain_event("OpenAI API key saved locally.")
-        messagebox.showinfo("Saved", "OpenAI API key saved successfully.")
+        self.log_chain_event("AI configuration saved locally.")
+        messagebox.showinfo("Saved", "AI configuration saved successfully.")
 
     def select_folder(self):
         folder = filedialog.askdirectory(title="Select Chrome Profile Folder")
@@ -694,7 +884,78 @@ class ForensicTool:
         self.render_charts()
         self.progress["value"] = 100
         self.log_chain_event("Professional V3 analysis completed.")
-        messagebox.showinfo("Analysis Complete", "Professional V3 analysis completed successfully.")
+        # Feature 6 — Real-time alert popup for sensitive findings
+        sensitive = [f for f in self.findings if f.get("severity") == "Sensitive"]
+        if sensitive:
+            self._show_alert_popup(sensitive)
+        else:
+            messagebox.showinfo("Analysis Complete", "Professional V3 analysis completed successfully.")
+
+    # ------------------------------------------------------------------ #
+    # Feature 6 — Real-time Alert Popup
+    # ------------------------------------------------------------------ #
+    def _show_alert_popup(self, sensitive_findings):
+        """Show a blinking red alert window listing all Sensitive findings."""
+        popup = tk.Toplevel(self.root)
+        popup.title("⚠ ALERT — Sensitive Findings Detected")
+        popup.configure(bg="#1a0000")
+        popup.geometry("640x480")
+        popup.resizable(True, True)
+        popup.transient(self.root)
+
+        # Center
+        self.root.update_idletasks()
+        px = self.root.winfo_x() + (self.root.winfo_width() // 2) - 320
+        py = self.root.winfo_y() + (self.root.winfo_height() // 2) - 240
+        popup.geometry(f"+{px}+{py}")
+
+        # Animated border via label background swap
+        border = tk.Frame(popup, bg="#dc2626", padx=3, pady=3)
+        border.pack(fill="both", expand=True, padx=6, pady=6)
+        inner = tk.Frame(border, bg="#1a0000")
+        inner.pack(fill="both", expand=True)
+
+        tk.Label(
+            inner,
+            text="🚨  SENSITIVE FINDINGS DETECTED",
+            fg="#ef4444", bg="#1a0000",
+            font=("Segoe UI", 15, "bold")
+        ).pack(pady=(20, 4))
+        tk.Label(
+            inner,
+            text=f"{len(sensitive_findings)} sensitive artifact(s) require immediate attention.",
+            fg="#fca5a5", bg="#1a0000",
+            font=("Segoe UI", 10)
+        ).pack(pady=(0, 14))
+
+        listbox = tk.Listbox(
+            inner, bg="#0f0000", fg="#fca5a5",
+            selectbackground="#7f1d1d", font=("Segoe UI", 9),
+            relief="flat", bd=0
+        )
+        for f in sensitive_findings:
+            listbox.insert(tk.END, f"  🔴  {f.get('title','')} — {f.get('details','')[:90]}")
+        listbox.pack(fill="both", expand=True, padx=16, pady=4)
+
+        btn_row = tk.Frame(inner, bg="#1a0000")
+        btn_row.pack(fill="x", padx=16, pady=14)
+
+        def go_findings():
+            popup.destroy()
+            self.tabs.select(self.chain_tab)   # switch focus to main window
+
+        self._button(btn_row, "View All Findings", go_findings, "#dc2626").pack(side="left")
+        self._button(btn_row, "Dismiss", popup.destroy, "#374151").pack(side="right")
+
+        # Blinking border animation
+        _blink_colors = ["#dc2626", "#7f1d1d"]
+        _blink_state = [0]
+        def blink():
+            if popup.winfo_exists():
+                border.config(bg=_blink_colors[_blink_state[0] % 2])
+                _blink_state[0] += 1
+                popup.after(700, blink)
+        blink()
 
     def _build_dashboard_tab(self):
         self.charts_scroll = tk.Canvas(self.dashboard_tab, bg="#162233", highlightthickness=0)
@@ -773,7 +1034,106 @@ class ForensicTool:
             canvas2 = FigureCanvasTkAgg(fig2, master=self.charts_frame)
             canvas2.draw()
             canvas2.get_tk_widget().pack(pady=20, fill="x", expand=True)
-            
+
+        # Feature 5 — Chart 3: Top 10 visited domains
+        history = self.data.get("history", [])
+        if history:
+            from urllib.parse import urlparse
+            from collections import Counter
+            domains = Counter()
+            for item in history:
+                try:
+                    netloc = urlparse(item.get("url", "")).netloc.lower()
+                    if netloc:
+                        domains[netloc] += item.get("visits", 1) or 1
+                except Exception:
+                    pass
+            top_domains = domains.most_common(10)
+            if top_domains:
+                fig3, ax3 = plt.subplots(figsize=(8, 4), dpi=100)
+                fig3.patch.set_facecolor('#162233')
+                ax3.set_facecolor('#162233')
+                labels3 = [d[0] for d in top_domains]
+                counts3 = [d[1] for d in top_domains]
+                bars3 = ax3.barh(labels3[::-1], counts3[::-1],
+                                 color='#6366f1', edgecolor='none', height=0.6)
+                ax3.set_title("Top 10 Most Visited Domains", color='white',
+                              fontsize=12, fontweight='bold')
+                ax3.tick_params(axis='x', colors='white')
+                ax3.tick_params(axis='y', colors='#94a3b8', labelsize=8)
+                ax3.set_xlabel("Visit Count", color='white')
+                for bar, val in zip(bars3, counts3[::-1]):
+                    ax3.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
+                             str(val), va='center', color='white', fontsize=8)
+                plt.tight_layout()
+                canvas3 = FigureCanvasTkAgg(fig3, master=self.charts_frame)
+                canvas3.draw()
+                canvas3.get_tk_widget().pack(pady=20, fill="x", expand=True)
+
+        # Feature 5 — Chart 4: Downloads by file extension
+        downloads = self.data.get("downloads", [])
+        if downloads:
+            import os as _os
+            from collections import Counter
+            ext_counter = Counter()
+            for dl in downloads:
+                path = dl.get("target_path", "")
+                if path:
+                    ext = _os.path.splitext(path)[1].lower() or "(none)"
+                    ext_counter[ext] += 1
+            top_ext = ext_counter.most_common(12)
+            if top_ext:
+                fig4, ax4 = plt.subplots(figsize=(8, 3.5), dpi=100)
+                fig4.patch.set_facecolor('#162233')
+                ax4.set_facecolor('#162233')
+                ext_labels = [e[0] for e in top_ext]
+                ext_counts = [e[1] for e in top_ext]
+                bar_colors = ['#ef4444' if ext in (
+                    '.exe','.msi','.bat','.cmd','.ps1','.vbs','.scr',
+                    '.jar','.apk','.dll','.zip','.rar','.7z'
+                ) else '#10b981' for ext in ext_labels]
+                ax4.bar(ext_labels, ext_counts, color=bar_colors, edgecolor='none', width=0.6)
+                ax4.set_title("Downloads by File Extension", color='white',
+                              fontsize=12, fontweight='bold')
+                ax4.tick_params(axis='x', colors='#94a3b8', rotation=30, labelsize=8)
+                ax4.tick_params(axis='y', colors='white')
+                ax4.set_ylabel("Count", color='white')
+                plt.tight_layout()
+                canvas4 = FigureCanvasTkAgg(fig4, master=self.charts_frame)
+                canvas4.draw()
+                canvas4.get_tk_widget().pack(pady=20, fill="x", expand=True)
+
+        # Feature 5 — Chart 5: Activity by hour of day
+        if self.timeline:
+            from collections import Counter
+            hour_counter = Counter()
+            for item in self.timeline:
+                t = item.get("time", "")
+                try:
+                    hour = int(t.split(" ")[1].split(":")[0])
+                    hour_counter[hour] += 1
+                except Exception:
+                    pass
+            if hour_counter:
+                fig5, ax5 = plt.subplots(figsize=(8, 3), dpi=100)
+                fig5.patch.set_facecolor('#162233')
+                ax5.set_facecolor('#162233')
+                hours = list(range(24))
+                values = [hour_counter.get(h, 0) for h in hours]
+                ax5.bar(hours, values, color='#f59e0b', edgecolor='none', width=0.75)
+                ax5.set_title("Activity Heatmap — Hour of Day", color='white',
+                              fontsize=12, fontweight='bold')
+                ax5.set_xticks(hours)
+                ax5.set_xticklabels([f"{h:02d}h" for h in hours],
+                                    rotation=45, ha='right', color='#94a3b8', fontsize=7)
+                ax5.tick_params(axis='y', colors='white')
+                ax5.set_xlabel("Hour (UTC)", color='white')
+                ax5.set_ylabel("Events", color='white')
+                plt.tight_layout()
+                canvas5 = FigureCanvasTkAgg(fig5, master=self.charts_frame)
+                canvas5.draw()
+                canvas5.get_tk_widget().pack(pady=20, fill="x", expand=True)
+
         plt.close('all') # Free memory
 
     def filter_treeview(self):
@@ -814,14 +1174,23 @@ class ForensicTool:
             return
 
         api_key = self.api_var.get().strip()
-        self.log_chain_event(f"AI summary requested using {AI_MODEL} (Threaded).")
-        
-        # Run AI in background
-        threading.Thread(target=self._run_ai_thread, args=(api_key,), daemon=True).start()
+        model = self.ai_model_var.get().strip() or AI_MODEL
+        base_url = self.ai_base_url_var.get().strip() or AI_BASE_URL
+        self.log_chain_event(f"AI summary requested using {model} (Threaded).")
 
-    def _run_ai_thread(self, api_key):
+        # Run AI in background
+        threading.Thread(target=self._run_ai_thread, args=(api_key, model, base_url), daemon=True).start()
+
+    def _run_ai_thread(self, api_key, model, base_url):
         try:
-            summary = generate_ai_summary(self.data, self.findings, api_key=api_key)
+            summary = generate_ai_summary(
+                self.data,
+                self.findings,
+                api_key=api_key,
+                provider="openrouter",
+                model=model,
+                base_url=base_url,
+            )
             self.root.after(0, lambda s=summary: self._on_ai_complete(s))
         except Exception as e:
             self.root.after(0, lambda err=e: messagebox.showerror("AI Error", str(err)))
@@ -871,24 +1240,63 @@ class ForensicTool:
                 self.data,
                 self.findings,
                 api_key=self.api_var.get().strip(),
+                provider="openrouter",
+                model=self.ai_model_var.get().strip() or AI_MODEL,
+                base_url=self.ai_base_url_var.get().strip() or AI_BASE_URL,
             )
+            self.root.after(0, self._update_summary_widget)
+
+    def _update_summary_widget(self):
+        self.summary_text.delete("1.0", tk.END)
+        self.summary_text.insert(tk.END, self.summary)
+
+    def _run_export_thread(self, export_type):
+        try:
+            self.ensure_summary()
+            
+            if export_type == "json":
+                path = export_json(
+                    self.case_meta["case_dir"],
+                    self.case_meta["case_id"],
+                    self.data,
+                    self.timeline,
+                    self.findings,
+                    self.summary,
+                )
+                self.log_chain_event(f"JSON exported: {path}")
+                self.root.after(0, lambda: messagebox.showinfo("Export Complete", f"JSON saved to:\n{path}"))
+            elif export_type == "pdf":
+                path = export_pdf(
+                    self.case_meta["case_dir"],
+                    self.case_meta["case_id"],
+                    self.data,
+                    self.findings,
+                    self.summary,
+                )
+                self.log_chain_event(f"PDF report exported: {path}")
+                self.root.after(0, lambda: messagebox.showinfo("Export Complete", f"PDF report saved to:\n{path}"))
+            elif export_type == "html":
+                path = export_html(
+                    self.case_meta["case_dir"],
+                    self.case_meta["case_id"],
+                    self.data,
+                    self.timeline,
+                    self.findings,
+                    self.summary,
+                )
+                self.log_chain_event(f"HTML report exported: {path}")
+                self.root.after(0, lambda: messagebox.showinfo("Export Complete", f"HTML report saved to:\n{path}"))
+        except Exception as e:
+            self.log_chain_event(f"{export_type.upper()} export error: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror(f"{export_type.upper()} Export Error", str(e)))
 
     def export_json_bundle(self):
         if not self.data:
             messagebox.showwarning("No Data", "Run analysis first.")
             return
 
-        self.ensure_summary()
-        path = export_json(
-            self.case_meta["case_dir"],
-            self.case_meta["case_id"],
-            self.data,
-            self.timeline,
-            self.findings,
-            self.summary,
-        )
-        self.log_chain_event(f"JSON exported: {path}")
-        messagebox.showinfo("Export Complete", f"JSON saved to:\n{path}")
+        self.log_chain_event("JSON export started (Threaded).")
+        threading.Thread(target=self._run_export_thread, args=("json",), daemon=True).start()
 
     def export_timeline_report(self):
         if not self.timeline:
@@ -922,38 +1330,36 @@ class ForensicTool:
             messagebox.showwarning("No Data", "Run analysis first.")
             return
 
-        self.ensure_summary()
-        try:
-            path = export_pdf(
-                self.case_meta["case_dir"],
-                self.case_meta["case_id"],
-                self.data,
-                self.findings,
-                self.summary,
-            )
-            self.log_chain_event(f"PDF report exported: {path}")
-            messagebox.showinfo("Export Complete", f"PDF report saved to:\n{path}")
-        except Exception as e:
-            self.log_chain_event(f"PDF export error: {str(e)}")
-            messagebox.showerror("PDF Export Error", str(e))
+        self.log_chain_event("PDF export started (Threaded).")
+        threading.Thread(target=self._run_export_thread, args=("pdf",), daemon=True).start()
 
     def export_html_report(self):
         if not self.data:
             messagebox.showwarning("No Data", "Run analysis first.")
             return
 
-        self.ensure_summary()
+        self.log_chain_event("HTML export started (Threaded).")
+        threading.Thread(target=self._run_export_thread, args=("html",), daemon=True).start()
+
+    def export_xlsx_report(self):
+        """Feature 8 — Export a colour-coded Excel workbook."""
+        if not self.data:
+            messagebox.showwarning("No Data", "Run analysis first.")
+            return
         try:
-            path = export_html(
+            path = export_xlsx(
                 self.case_meta["case_dir"],
                 self.case_meta["case_id"],
                 self.data,
-                self.timeline,
                 self.findings,
-                self.summary,
             )
-            self.log_chain_event(f"HTML report exported: {path}")
-            messagebox.showinfo("Export Complete", f"HTML report saved to:\n{path}")
+            self.log_chain_event(f"XLSX report exported: {path}")
+            messagebox.showinfo("Export Complete", f"Excel report saved to:\n{path}")
+        except ImportError:
+            messagebox.showerror(
+                "Missing Library",
+                "openpyxl is not installed.\nRun:  pip install openpyxl"
+            )
         except Exception as e:
-            self.log_chain_event(f"HTML export error: {str(e)}")
-            messagebox.showerror("HTML Export Error", str(e))
+            self.log_chain_event(f"XLSX export error: {str(e)}")
+            messagebox.showerror("XLSX Export Error", str(e))

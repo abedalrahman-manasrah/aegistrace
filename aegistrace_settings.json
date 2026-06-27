@@ -1,19 +1,9 @@
 {
-  "last_folder": "C:/Users/vbngv/AppData/Local/Google/Chrome/User Data/Default",
-  "last_case_id": "01",
-  "anthropic_api_key": "sk-qVpyd0dhJncICORHFrM4hecgj9cCB2eGGdgzxFAgXNUrUMYm",
-  "last_investigator": "عبد الرحمن مناصرة",
-  "suspicious_keywords": [
-    "vpn",
-    "tor",
-    "crypto",
-    "binance",
-    "hacker",
-    "proxy",
-    "onion",
-    "darkweb",
-    "bypass",
-    "exploit",
-    "ward"
-  ]
+  "last_investigator": "Investigator_01",
+  "last_case_id": "CASE_2026_01",
+  "openrouter_api_key": "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",
+  "ai_model": "openai/gpt-4o-mini",
+  "ai_base_url": "https://openrouter.ai/api/v1",
+  "openai_api_key": "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",
+  "last_folder": "C:/Users/vbngv/AppData/Local/Google/Chrome/User Data/Default"
 }

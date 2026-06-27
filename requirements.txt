@@ -1,5 +1,7 @@
-anthropic
-reportlab
-openai
-matplotlib
 Pillow
+anthropic
+matplotlib
+openai
+reportlab
+requests
+openpyxl

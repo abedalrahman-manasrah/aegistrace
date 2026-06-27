@@ -31,8 +31,16 @@ APP_AUTHOR = "Built by Abed Alrahman Manasrah"
 EXPORT_DIR = os.path.join(os.getcwd(), "Forensics_Reports")
 SETTINGS_FILE = os.path.join(os.getcwd(), "aegistrace_settings.json")
 
-AI_MODEL = "gpt-4o"
-AI_BASE_URL = "https://api.openai.com/v1"
+# AI defaults.
+# OpenRouter is OpenAI-compatible, so the same OpenAI SDK can be used with a different base_url.
+DEFAULT_AI_PROVIDER = "openrouter"
+DEFAULT_AI_MODEL = "openai/gpt-4o-mini"
+DEFAULT_AI_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Backward-compatible constants used by the GUI.
+AI_PROVIDER = DEFAULT_AI_PROVIDER
+AI_MODEL = DEFAULT_AI_MODEL
+AI_BASE_URL = DEFAULT_AI_BASE_URL
 
 # Configure Logging
 logging.basicConfig(
@@ -622,6 +630,83 @@ def analyze_local_storage(profile_folder):
     return rows[:200]
 
 
+def analyze_deleted_records(profile_folder, evidence_dir):
+    """
+    Feature 4: Detect potentially deleted records by inspecting WAL/Journal companion
+    files alongside Chrome SQLite databases. Reports any WAL/journal presence as a
+    forensic artifact and attempts ID-gap detection in the History database.
+    """
+    results = []
+    db_targets = [
+        ("History", "urls", "id"),
+        ("Login Data", "logins", "id"),
+        ("Web Data", "autofill", "count"),
+        ("Cookies", "cookies", "creation_utc"),
+    ]
+
+    for db_name, table, id_col in db_targets:
+        db_path = os.path.join(profile_folder, db_name)
+        if not os.path.exists(db_path):
+            continue
+
+        # --- 1. WAL / Journal presence check ---
+        for suffix, label in [("-wal", "WAL"), ("-journal", "Journal"), ("-shm", "SHM")]:
+            companion = db_path + suffix
+            if os.path.exists(companion):
+                size = os.path.getsize(companion)
+                results.append({
+                    "database": db_name,
+                    "file_type": label,
+                    "file": os.path.basename(companion),
+                    "size_bytes": size,
+                    "note": (
+                        f"{label} companion file detected for '{db_name}'. "
+                        "May contain uncommitted or recently deleted transaction data. "
+                        f"Size: {size:,} bytes."
+                    ),
+                    "risk": "Sensitive" if size > 0 else "Info",
+                })
+
+        # --- 2. ID gap analysis (History only) ---
+        if db_name == "History" and table == "urls":
+            try:
+                copied = safe_copy_db(db_path, evidence_dir)
+                conn = sqlite3.connect(copied)
+                cur = conn.cursor()
+                cur.execute(f"SELECT {id_col} FROM {table} ORDER BY {id_col} ASC")
+                ids = [row[0] for row in cur.fetchall()]
+                conn.close()
+
+                gaps = []
+                for i in range(1, len(ids)):
+                    diff = ids[i] - ids[i - 1]
+                    if diff > 1:
+                        gaps.append((ids[i - 1], ids[i], diff - 1))
+
+                if gaps:
+                    total_missing = sum(g[2] for g in gaps)
+                    sample = "; ".join(
+                        f"gap after id={g[0]} ({g[2]} missing)"
+                        for g in gaps[:5]
+                    )
+                    results.append({
+                        "database": db_name,
+                        "file_type": "ID Gap",
+                        "file": db_name,
+                        "size_bytes": 0,
+                        "note": (
+                            f"Detected {len(gaps)} ID gaps in '{table}' table totalling "
+                            f"{total_missing} potentially deleted rows. Sample: {sample}"
+                        ),
+                        "risk": "Sensitive",
+                    })
+            except Exception as e:
+                logger.warning(f"ID gap analysis failed for {db_name}: {e}")
+
+    results.sort(key=lambda x: x.get("risk", "Info"), reverse=True)
+    return results[:100]
+
+
 def build_timeline(data):
     timeline = []
 
@@ -876,85 +961,252 @@ def generate_rule_based_summary(data, findings):
     return "\n".join(lines)
 
 
-def generate_ai_summary(data, findings, api_key=None):
+
+SENSITIVE_AI_FIELDS = {
+    "value",
+    "password_value",
+    "encrypted_value",
+    "cookie_value",
+    "token",
+    "access_token",
+    "refresh_token",
+    "session",
+    "secret",
+}
+
+HIGH_RISK_DOWNLOAD_EXTENSIONS = (
+    ".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar",
+    ".scr", ".iso", ".img", ".apk", ".dll", ".zip", ".rar", ".7z"
+)
+
+
+def _safe_domain(url):
+    """Return only the domain for AI context where a full URL may be too sensitive."""
+    try:
+        return urlparse(url or "").netloc.lower()
+    except Exception:
+        return ""
+
+
+def _safe_url_for_ai(url):
+    """Keep URL context while removing query strings/fragments that may contain tokens."""
+    try:
+        parsed = urlparse(url or "")
+        safe = f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.scheme and parsed.netloc else (url or "")
+        return safe[:500]
+    except Exception:
+        return (url or "")[:500]
+
+
+def _redact_value(key, value):
+    """Remove sensitive values before sending data to an external AI model."""
+    key_l = str(key).lower()
+    if any(s in key_l for s in SENSITIVE_AI_FIELDS):
+        return "[REDACTED]"
+
+    if isinstance(value, str):
+        # Keep long values from overloading the model or leaking too much raw evidence.
+        return value[:500]
+    return value
+
+
+def sanitize_record_for_ai(record):
+    """Create a minimal AI-safe copy of a parsed artifact record."""
+    if not isinstance(record, dict):
+        return record
+
+    cleaned = {}
+    for key, value in record.items():
+        key_l = str(key).lower()
+
+        if key_l in {"url", "source_url", "origin_url", "referrer", "page_url", "icon_url"}:
+            cleaned[key] = _safe_url_for_ai(value) if isinstance(value, str) else value
+            cleaned[f"{key}_domain"] = _safe_domain(value) if isinstance(value, str) else ""
+            continue
+
+        cleaned[key] = _redact_value(key, value)
+
+    return cleaned
+
+
+def build_ai_prompt_data(data, findings, max_items=50):
+    """Prepare a prioritized, privacy-aware forensic context for the AI model."""
+    safe_data = {
+        "counts": {k: len(v) for k, v in data.items() if isinstance(v, list)},
+        "findings": findings[:100],  # Include up to 100 findings for a richer context
+        "artifacts": {},
+        "analysis_rules": [
+            "Act as an expert digital forensics investigator (GCFE/GCFA style).",
+            "Perform advanced analysis: Chronological Link Analysis, Anti-Forensics Analysis, and Exfiltration Assessment.",
+            "Separate verified evidence facts from analytical hypotheses and leads.",
+            "Do not disclose cookie values, passwords, tokens, or sensitive raw sessions.",
+            "Report anti-forensics indicators (e.g. ID gaps in deleted records, unusual companion files)."
+        ],
+    }
+
+    # Include all 13 artifacts (including deleted_records, topsites, favicons)
+    artifact_names = [
+        "history", "downloads", "cookies", "logins", "bookmarks", "webdata",
+        "extensions", "sessions", "local_storage", "preferences", "deleted_records",
+        "topsites", "favicons"
+    ]
+
+    for name in artifact_names:
+        items = data.get(name, [])
+        if not isinstance(items, list):
+            continue
+
+        # Score and prioritize items
+        scored_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            
+            # Sanitized item
+            sanitized = sanitize_record_for_ai(item)
+            
+            # Calculate severity score
+            score = 0
+            # 1. Contains suspicious keywords
+            val_str = " ".join(str(v).lower() for v in item.values())
+            if check_keywords(val_str):
+                score += 100
+                
+            # 2. Risk fields / High-risk categories
+            if name == "downloads":
+                ext = str(item.get("target_path", "")).lower()
+                if any(ext.endswith(x) for x in [".exe", ".msi", ".bat", ".cmd", ".ps1", ".vbs", ".scr", ".jar", ".apk", ".dll", ".zip", ".rar", ".7z"]):
+                    score += 80
+            elif name == "deleted_records":
+                if item.get("risk") == "Sensitive":
+                    score += 90
+            elif name == "logins":
+                dom = str(item.get("action_url_domain", "")).lower()
+                if any(x in dom for x in ["binance", "crypto", "paypal", "bank", "login", "admin", "secure"]):
+                    score += 70
+            elif name == "extensions":
+                if not item.get("installed_by_custodian", True):
+                    score += 50
+
+            scored_items.append((score, sanitized))
+
+        # Sort by score descending and take max_items
+        scored_items.sort(key=lambda x: x[0], reverse=True)
+        safe_data["artifacts"][name] = [item for _, item in scored_items[:max_items]]
+
+    return safe_data
+
+
+def detect_high_risk_downloads(downloads):
+    """Generate additional forensic findings for suspicious/high-risk downloaded file types."""
+    results = []
+    for item in downloads or []:
+        if not isinstance(item, dict):
+            continue
+        path = (item.get("target_path") or item.get("current_path") or "").lower()
+        source_url = item.get("source_url", "")
+        if path.endswith(HIGH_RISK_DOWNLOAD_EXTENSIONS):
+            results.append({
+                "severity": "Sensitive",
+                "title": "High-Risk Download Type Observed",
+                "details": (
+                    f"Downloaded file has a potentially high-risk extension: "
+                    f"{item.get('target_path') or item.get('current_path') or 'Unknown path'} "
+                    f"| Source: {source_url[:150]}"
+                )
+            })
+    return results[:25]
+
+
+
+def generate_ai_summary(data, findings, api_key=None, provider=None, model=None, base_url=None):
+    """
+    Generate an AI-assisted forensic summary.
+
+    Supports:
+    - OpenRouter through the OpenAI-compatible API.
+    - OpenAI direct API.
+    - Anthropic direct API when provider='anthropic'.
+
+    The function never sends raw cookie values, passwords, tokens, or full session secrets.
+    If no key is provided or the request fails, it returns the local rule-based summary.
+    """
     if not api_key:
         return generate_rule_based_summary(data, findings)
 
-    prompt_data = {
-        "counts": {k: len(v) for k, v in data.items()},
-        "sample_history": data.get("history", [])[:15],
-        "sample_downloads": data.get("downloads", [])[:15],
-        "sample_logins": data.get("logins", [])[:15],
-        "sample_bookmarks": data.get("bookmarks", [])[:15],
-        "sample_webdata": data.get("webdata", [])[:15],
-        "sample_extensions": data.get("extensions", [])[:15],
-        "findings": findings,
-    }
+    provider = (provider or DEFAULT_AI_PROVIDER).strip().lower()
+    model = (model or DEFAULT_AI_MODEL).strip()
+    base_url = (base_url or DEFAULT_AI_BASE_URL).strip()
 
-    # 1. Try OpenAI client first
-    openai_err = None
+    prompt_data = build_ai_prompt_data(data, findings)
+
+    system_prompt = (
+        "You are a Senior Digital Forensics and Incident Response (DFIR) Specialist holding GCFA, GCFE, and CHFI certifications. "
+        "Your task is to analyze the provided Chrome browser artifact context and generate a high-impact, expert forensic report.\n\n"
+        "Strictly adhere to the following structure and guidelines in your response:\n"
+        "1. CASE THREAT LEVEL: Begin with a single-line summary stating: 'Threat Level Assessment: [CRITICAL | HIGH | MEDIUM | LOW]' with a brief 1-sentence reason.\n"
+        "2. EXECUTIVE SUMMARY: High-level narrative of what occurred, target system state, and overall summary of analyst findings.\n"
+        "3. CORRELATION & LINK ANALYSIS: Chronologically tie together events. Identify sequences such as: search query -> download -> site visit -> extension install. Prove coordination between artifacts.\n"
+        "4. ANTI-FORENSICS ANALYSIS: Deeply audit deleted records, sqlite WAL/journal companion files presence, database ID gaps, and suspicious settings. Hypothesize attempts to cover tracks.\n"
+        "5. EXFILTRATION & PRIVACY AUDIT: Identify indicators of data leakage (use of file sharing, cloud storage, anonymous paste sites), proxy/VPN extensions, or cryptocurrency portals.\n"
+        "6. ACTIONABLE DFIR NEXT STEPS: Provide concrete host-based investigation leads (e.g., audit Windows Event Logs Event ID 4624, examine registry keys like UserAssist or ShellBags, collect memory dumps, or isolate network).\n"
+        "7. LIMITATIONS & COGNITIVE BIAS NOTICE: Clearly state what data is missing, potential biases, and remind that this AI report must be validated by a human forensic analyst."
+    )
+
     try:
+        if provider == "anthropic":
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model=model if model else "claude-3-5-sonnet-20241022",
+                max_tokens=1400,
+                temperature=0.2,
+                system=system_prompt,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": json.dumps(prompt_data, ensure_ascii=False, indent=2),
+                    }
+                ],
+            )
+            return response.content[0].text.strip()
+
+        # Default path: OpenRouter/OpenAI/custom OpenAI-compatible endpoint.
         from openai import OpenAI
 
-        client = OpenAI(
-            api_key=api_key,
-            base_url=AI_BASE_URL
-        )
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+
+        client = OpenAI(**client_kwargs)
 
         response = client.chat.completions.create(
-            model=AI_MODEL,
+            model=model,
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "You are a professional digital forensic analyst. "
-                        "Generate a concise investigative summary based only on the provided browser artifacts. "
-                        "Do not overstate conclusions. Separate factual observations from cautious inferences."
-                    )
+                    "content": system_prompt,
                 },
                 {
                     "role": "user",
                     "content": json.dumps(prompt_data, ensure_ascii=False, indent=2),
                 }
             ],
-            max_tokens=1200,
+            max_tokens=1400,
             temperature=0.2,
         )
 
         return response.choices[0].message.content.strip()
 
     except Exception as e:
-        openai_err = e
-        logger.warning(f"OpenAI analysis failed (will attempt Anthropic fallback): {str(e)}")
-
-    # 2. Fallback to Anthropic Claude client
-    try:
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1200,
-            temperature=0.2,
-            system=(
-                "You are a professional digital forensic analyst. "
-                "Generate a concise investigative summary based only on the provided browser artifacts. "
-                "Do not overstate conclusions. Separate factual observations from cautious inferences."
-            ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": json.dumps(prompt_data, ensure_ascii=False, indent=2),
-                }
-            ],
+        logger.error(f"AI analysis failed via provider={provider}, model={model}, base_url={base_url}: {str(e)}")
+        fallback = generate_rule_based_summary(data, findings)
+        return (
+            fallback
+            + "\n\n[AI Analysis Notice]\n"
+            + f"External AI analysis failed, so AegisTrace used the local rule-based summary. Error: {str(e)}"
         )
-        return response.content[0].text.strip()
-    except Exception as anth_err:
-        logger.error(f"Anthropic fallback analysis failed: {str(anth_err)}")
-        # Quietly log both errors but keep the final report summary clean and professional
-        logger.error(f"OpenAI error: {str(openai_err)}")
-        logger.error(f"Anthropic error: {str(anth_err)}")
-        return generate_rule_based_summary(data, findings)
 
 
 def initialize_case(case_id, investigator="Unknown", notes=""):
@@ -1026,6 +1278,144 @@ def export_history_csv(case_dir, case_id, history):
                 item.get("visits", ""),
                 item.get("last_visit", ""),
             ])
+    return path
+
+
+def export_xlsx(case_dir, case_id, data, findings):
+    """Feature 8: Export all artifact data to a colour-coded Excel workbook.
+    - One sheet per artifact type
+    - A Summary sheet with counts and findings
+    - Suspicious rows highlighted in light red, headers in dark blue
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import (
+            PatternFill, Font, Alignment, Border, Side, GradientFill
+        )
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        logger.error("openpyxl is not installed. Run: pip install openpyxl")
+        raise
+
+    path = os.path.join(case_dir, f"{case_id}_report.xlsx")
+    wb = Workbook()
+
+    # --- Styles ---
+    header_fill   = PatternFill("solid", fgColor="1E3A8A")   # dark blue
+    warning_fill  = PatternFill("solid", fgColor="FEE2E2")   # light red
+    notable_fill  = PatternFill("solid", fgColor="FEF9C3")   # light yellow
+    alt_fill      = PatternFill("solid", fgColor="F1F5F9")   # very light grey
+    header_font   = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
+    normal_font   = Font(name="Calibri", size=9)
+    center_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_align    = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    thin_border   = Border(
+        left=Side(style="thin", color="CBD5E1"),
+        right=Side(style="thin", color="CBD5E1"),
+        top=Side(style="thin", color="CBD5E1"),
+        bottom=Side(style="thin", color="CBD5E1"),
+    )
+
+    def style_header_row(ws, headers):
+        for col_idx, header in enumerate(headers, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.fill    = header_fill
+            cell.font    = header_font
+            cell.alignment = center_align
+            cell.border  = thin_border
+
+    def auto_width(ws):
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_len = max(max_len, len(str(cell.value)))
+                except:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max(max_len + 4, 10), 50)
+
+    # --- Summary Sheet ---
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+    ws_sum.freeze_panes = "A2"
+
+    style_header_row(ws_sum, ["Artifact Type", "Count", "Notes"])
+    severity_order = {"Sensitive": "🔴", "Notable": "🟡", "Info": "🔵"}
+
+    for row_idx, (key, items) in enumerate(data.items(), start=2):
+        count = len(items) if isinstance(items, list) else 0
+        fill = alt_fill if row_idx % 2 == 0 else PatternFill()
+        for col_idx, val in enumerate(
+            [key.replace("_", " ").title(), count, ""], start=1
+        ):
+            cell = ws_sum.cell(row=row_idx, column=col_idx, value=val)
+            cell.fill      = fill
+            cell.font      = normal_font
+            cell.alignment = left_align
+            cell.border    = thin_border
+    auto_width(ws_sum)
+
+    # --- Findings Sheet ---
+    ws_f = wb.create_sheet("Findings")
+    ws_f.freeze_panes = "A2"
+    style_header_row(ws_f, ["Severity", "Title", "Details"])
+    for row_idx, f in enumerate(findings, start=2):
+        sev = f.get("severity", "Info")
+        fill = warning_fill if sev == "Sensitive" else (notable_fill if sev == "Notable" else PatternFill())
+        for col_idx, val in enumerate(
+            [severity_order.get(sev, "") + " " + sev, f.get("title", ""), f.get("details", "")],
+            start=1,
+        ):
+            cell = ws_f.cell(row=row_idx, column=col_idx, value=val)
+            cell.fill      = fill
+            cell.font      = normal_font
+            cell.alignment = left_align
+            cell.border    = thin_border
+    auto_width(ws_f)
+
+    # --- One sheet per artifact ---
+    for artifact_name, items in data.items():
+        if not items or not isinstance(items, list):
+            continue
+        valid_rows = [r for r in items if isinstance(r, dict)]
+        if not valid_rows:
+            continue
+
+        # Collect union of all keys
+        all_keys = []
+        for row in valid_rows:
+            for k in row:
+                if k not in all_keys:
+                    all_keys.append(k)
+
+        sheet_name = artifact_name.replace("_", " ").title()[:31]
+        ws = wb.create_sheet(title=sheet_name)
+        ws.freeze_panes = "A2"
+        ws.row_dimensions[1].height = 20
+
+        style_header_row(ws, [k.replace("_", " ").title() for k in all_keys])
+
+        for row_idx, item in enumerate(valid_rows, start=2):
+            # Determine row highlight
+            is_suspicious = any(check_keywords(str(v)) for v in item.values())
+            row_fill = warning_fill if is_suspicious else (
+                alt_fill if row_idx % 2 == 0 else PatternFill()
+            )
+            for col_idx, key in enumerate(all_keys, start=1):
+                val = item.get(key, "")
+                val_str = str(val) if not isinstance(val, (int, float, bool)) else val
+                cell = ws.cell(row=row_idx, column=col_idx, value=val_str)
+                cell.fill      = row_fill
+                cell.font      = normal_font
+                cell.alignment = left_align
+                cell.border    = thin_border
+
+        auto_width(ws)
+
+    wb.save(path)
+    logger.info(f"XLSX report saved: {path}")
     return path
 
 
@@ -1698,6 +2088,7 @@ def run_full_analysis(profile_folder, case_meta, log_callback=None):
         ("favicons", analyze_favicons, (profile_folder, case_meta["evidence_dir"])),
         ("sessions", analyze_sessions, (profile_folder,)),
         ("local_storage", analyze_local_storage, (profile_folder,)),
+        ("deleted_records", analyze_deleted_records, (profile_folder, case_meta["evidence_dir"])),
     ]
 
     for key, fn, args in analyzers:
@@ -1712,6 +2103,7 @@ def run_full_analysis(profile_folder, case_meta, log_callback=None):
 
     timeline = build_timeline(data)
     findings = build_findings(data)
+    findings.extend(detect_high_risk_downloads(data.get("downloads", [])))
 
     # 4. Keyword Detection for Findings
     seen_findings = set()
